@@ -1,0 +1,684 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="本地 SQLite 持久化的每日计划、计时与复盘工具"
+    />
+    <title>每日计划</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <a class="brand" href="/" aria-label="每日计划首页">
+        <span class="brand-mark">今</span>
+        <span>
+          <strong>每日计划</strong>
+          <small>把计划变成可复盘的记录</small>
+        </span>
+      </a>
+      <nav class="main-nav" aria-label="主导航">
+        <button class="nav-button is-active" data-view="today">今日</button>
+        <button class="nav-button" data-view="report">复盘</button>
+        <button class="nav-button" data-view="memos">感悟库</button>
+      </nav>
+      <div class="storage-status" title="数据保存在项目目录 data 文件夹中">
+        <span class="status-dot"></span>
+        SQLite 本地保存
+      </div>
+    </header>
+
+    <div id="runningBar" class="running-bar" hidden>
+      <div>
+        <span class="pulse-dot"></span>
+        <span id="runningModeLabel" class="running-label">正在计时</span>
+        <strong id="runningTitle"></strong>
+        <time id="runningTime">00:00:00</time>
+      </div>
+      <span id="runningProgress" class="running-progress" hidden>
+        <i></i>
+      </span>
+      <button id="globalStopButton" class="button danger compact">结束计时</button>
+    </div>
+
+    <div id="breakBar" class="break-bar" hidden>
+      <div>
+        <span>☕</span>
+        <strong>休息一下</strong>
+        <time id="breakTime">05:00</time>
+      </div>
+      <button id="stopBreakButton" class="button subtle compact">结束休息</button>
+    </div>
+
+    <main class="page-shell">
+      <section id="todayView" class="view">
+        <div class="view-toolbar">
+          <div>
+            <p class="eyebrow" id="dateEyebrow">今天</p>
+            <h1 id="dateTitle">今日计划</h1>
+          </div>
+          <div class="date-controls">
+            <button id="previousDay" class="icon-button" aria-label="前一天">←</button>
+            <input id="dayPicker" type="date" aria-label="选择日期" />
+            <button id="nextDay" class="icon-button" aria-label="后一天">→</button>
+            <button id="backToday" class="button subtle compact">回到今天</button>
+          </div>
+        </div>
+
+        <section class="summary-grid" aria-label="当天概览">
+          <article class="summary-card accent">
+            <span>计划投入</span>
+            <strong id="plannedTotal">0 分钟</strong>
+            <small id="plannedTaskCount">还没有任务</small>
+          </article>
+          <article class="summary-card">
+            <span>实际有效</span>
+            <strong id="actualTotal">0 分钟</strong>
+            <small>由计时器自动累计</small>
+          </article>
+          <article class="summary-card">
+            <span>完成进度</span>
+            <strong id="completionTotal">0 / 0</strong>
+            <div class="progress-track">
+              <span id="completionBar" style="width: 0%"></span>
+            </div>
+          </article>
+          <article class="summary-card">
+            <span>预估偏差</span>
+            <strong id="varianceTotal">—</strong>
+            <small id="varianceHint">完成计时后可对照</small>
+          </article>
+        </section>
+
+        <section class="focus-card">
+          <label for="focusInput">今天最想推进的一件事</label>
+          <input
+            id="focusInput"
+            type="text"
+            maxlength="500"
+            placeholder="即使其他事情被打断，今天也要推进什么？"
+          />
+          <span id="daySaveStatus" class="save-status" aria-live="polite"></span>
+        </section>
+
+        <div class="today-layout">
+          <div class="primary-column">
+            <section class="panel task-panel">
+              <div class="panel-header">
+                <div>
+                  <p class="eyebrow">任务清单</p>
+                  <h2>今天要做的事</h2>
+                </div>
+                <div class="task-heading-actions">
+                  <span id="capacityHint" class="capacity-hint"></span>
+                  <button id="toggleAddTask" class="button primary">＋ 添加任务</button>
+                </div>
+              </div>
+
+              <form id="addTaskForm" class="add-task-form" hidden>
+                <div id="subtaskContext" class="subtask-context" hidden>
+                  正在为 <strong id="parentTaskName"></strong> 添加子任务
+                  <button id="cancelSubtask" type="button">取消</button>
+                </div>
+                <label class="wide-field">
+                  <span>任务名称</span>
+                  <input
+                    id="newTaskTitle"
+                    name="title"
+                    type="text"
+                    maxlength="240"
+                    autocomplete="off"
+                    placeholder="写清楚下一步动作，例如：整理访谈提纲"
+                    required
+                  />
+                </label>
+                <label>
+                  <span>项目（可选）</span>
+                  <input
+                    id="newTaskProject"
+                    name="project"
+                    type="text"
+                    maxlength="80"
+                    list="projectOptions"
+                    placeholder="例如：飞书抓取"
+                  />
+                </label>
+                <label>
+                  <span>预估分钟</span>
+                  <input
+                    id="newTaskEstimate"
+                    name="estimate"
+                    type="number"
+                    min="0"
+                    max="1440"
+                    step="5"
+                    value="60"
+                    required
+                  />
+                </label>
+                <label>
+                  <span>计划开始（可选）</span>
+                  <input id="newTaskStart" name="plannedStart" type="time" />
+                </label>
+                <div class="estimate-presets wide-field" aria-label="常用预估时间">
+                  <span>快捷：</span>
+                  <button type="button" data-minutes="15">15 分钟</button>
+                  <button type="button" data-minutes="30">30 分钟</button>
+                  <button type="button" data-minutes="45">45 分钟</button>
+                  <button type="button" data-minutes="60">1 小时</button>
+                  <button type="button" data-minutes="90">1.5 小时</button>
+                  <button type="button" data-minutes="120">2 小时</button>
+                </div>
+                <div class="form-actions wide-field">
+                  <button type="button" id="cancelAddTask" class="button subtle">
+                    取消
+                  </button>
+                  <button type="submit" class="button primary">加入今天</button>
+                </div>
+              </form>
+
+              <datalist id="projectOptions"></datalist>
+
+              <div id="taskList" class="task-list" aria-live="polite"></div>
+              <div id="emptyTasks" class="empty-state" hidden>
+                <div class="empty-icon">✓</div>
+                <h3>今天还没有安排</h3>
+                <p>先写下一件真正值得推进的事，再估一个大致时间。</p>
+                <button class="button primary" data-action="show-add">
+                  添加第一条任务
+                </button>
+              </div>
+            </section>
+
+            <section class="panel worklog-panel">
+              <div class="panel-header compact-header">
+                <div>
+                  <p class="eyebrow">真实投入</p>
+                  <h2>今日工作日志</h2>
+                </div>
+                <span id="worklogTotal" class="autosave-label">0 分钟</span>
+              </div>
+              <div id="worklogList" class="worklog-list"></div>
+            </section>
+          </div>
+
+          <aside class="side-column">
+            <section class="panel reflection-panel">
+              <div class="panel-header compact-header">
+                <div>
+                  <p class="eyebrow">随手记录</p>
+                  <h2>今日感悟</h2>
+                </div>
+                <span class="autosave-label">自动保存</span>
+              </div>
+              <textarea
+                id="reflectionInput"
+                rows="8"
+                maxlength="8000"
+                placeholder="今天发现了什么？哪些方法有效？明天要避免什么？"
+              ></textarea>
+              <fieldset class="mood-picker">
+                <legend>今天的状态</legend>
+                <div>
+                  <button type="button" data-mood="1" title="很差">1</button>
+                  <button type="button" data-mood="2" title="较差">2</button>
+                  <button type="button" data-mood="3" title="一般">3</button>
+                  <button type="button" data-mood="4" title="不错">4</button>
+                  <button type="button" data-mood="5" title="很好">5</button>
+                </div>
+              </fieldset>
+            </section>
+
+            <section class="panel quick-memo-panel">
+              <div class="panel-header compact-header">
+                <div>
+                  <p class="eyebrow">碎片记录</p>
+                  <h2>一条碎片感悟</h2>
+                </div>
+              </div>
+              <form id="quickMemoForm" class="quick-memo-form">
+                <textarea
+                  id="quickMemoContent"
+                  rows="3"
+                  maxlength="4000"
+                  placeholder="刚刚想到什么？每条只记一个念头。"
+                  required
+                ></textarea>
+                <input
+                  id="quickMemoTags"
+                  type="text"
+                  maxlength="300"
+                  placeholder="标签，例如：估时, 产品"
+                />
+                <button type="submit" class="button primary">记下来</button>
+              </form>
+              <div id="todayMemoList" class="today-memo-list"></div>
+            </section>
+
+            <section class="panel shutdown-panel">
+              <span class="shutdown-icon">↘</span>
+              <h2>今天收工前</h2>
+              <p>处理每一条未完成任务：完成、明天继续、改期或放弃，并留下原因。</p>
+              <button id="openCloseDay" class="button dark full-width">
+                开始收工复盘
+              </button>
+              <p id="closedDayNote" class="closed-note" hidden>
+                这一天已经完成收工复盘
+              </p>
+            </section>
+          </aside>
+        </div>
+      </section>
+
+      <section id="reportView" class="view" hidden>
+        <div class="view-toolbar">
+          <div>
+            <p class="eyebrow">从记录中找规律</p>
+            <h1 id="weekTitle">复盘报告</h1>
+          </div>
+          <div class="report-controls">
+            <div class="period-switch" aria-label="复盘周期">
+              <button class="is-active" data-period="week">周</button>
+              <button data-period="month">月</button>
+              <button data-period="quarter">季度</button>
+            </div>
+            <div class="date-controls">
+              <button id="previousPeriod" class="icon-button" aria-label="上一个周期">←</button>
+              <button id="currentPeriod" class="button subtle compact">当前周期</button>
+              <button id="nextPeriod" class="icon-button" aria-label="下一个周期">→</button>
+            </div>
+          </div>
+        </div>
+
+        <section class="summary-grid week-summary">
+          <article class="summary-card accent">
+            <span id="reportPlannedLabel">本周期计划</span>
+            <strong id="weekPlanned">0 小时</strong>
+            <small>每天预估相加</small>
+          </article>
+          <article class="summary-card">
+            <span>有效工作</span>
+            <strong id="weekActual">0 小时</strong>
+            <small>所有计时段相加</small>
+          </article>
+          <article class="summary-card">
+            <span>完成安排</span>
+            <strong id="weekCompleted">0 / 0</strong>
+            <small id="weekCompletionRate">完成率 0%</small>
+          </article>
+          <article class="summary-card">
+            <span>预估偏差</span>
+            <strong id="weekVariance">—</strong>
+            <small>实际与计划的差值</small>
+          </article>
+        </section>
+
+        <div class="week-layout">
+          <section class="panel week-chart-panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">投入时间</p>
+                <h2>每天计划与实际</h2>
+              </div>
+              <div class="chart-legend">
+                <span><i class="planned-legend"></i>计划</span>
+                <span><i class="actual-legend"></i>实际</span>
+              </div>
+            </div>
+            <div id="weekChart" class="week-chart"></div>
+          </section>
+
+          <section class="panel heatmap-panel">
+            <div class="panel-header compact-header">
+              <div>
+                <p class="eyebrow">专注习惯</p>
+                <h2>有效工作热力图</h2>
+              </div>
+              <span id="streakLabel" class="autosave-label"></span>
+            </div>
+            <div id="focusHeatmap" class="focus-heatmap"></div>
+          </section>
+
+          <section class="panel insights-panel">
+            <div class="panel-header compact-header">
+              <div>
+                <p class="eyebrow">把数据变成行动</p>
+                <h2>复盘洞察</h2>
+              </div>
+            </div>
+            <div id="insightList" class="insight-list"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header compact-header">
+              <div>
+                <p class="eyebrow">偏差来源</p>
+                <h2>未完成原因</h2>
+              </div>
+            </div>
+            <div id="reasonList" class="rank-list"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header compact-header">
+              <div>
+                <p class="eyebrow">时间去向</p>
+                <h2>项目投入</h2>
+              </div>
+            </div>
+            <div id="projectStats" class="project-stats"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header compact-header">
+              <div>
+                <p class="eyebrow">需要注意</p>
+                <h2>反复顺延</h2>
+              </div>
+            </div>
+            <div id="carryoverList" class="carryover-list"></div>
+          </section>
+
+          <section class="panel focus-stats-panel">
+            <div class="panel-header compact-header">
+              <div>
+                <p class="eyebrow">专注统计</p>
+                <h2>专注段</h2>
+              </div>
+            </div>
+            <div id="focusStats" class="focus-stats"></div>
+          </section>
+
+          <section class="panel week-review-panel">
+            <div class="panel-header compact-header">
+              <div>
+                <p class="eyebrow">形成下一步</p>
+                <h2 id="reviewHeading">本周期结论</h2>
+              </div>
+              <span id="weekReviewStatus" class="save-status"></span>
+            </div>
+            <textarea
+              id="weekReviewInput"
+              rows="5"
+              maxlength="10000"
+              placeholder="哪类任务总是低估？下周减少什么、继续什么、调整什么？"
+            ></textarea>
+            <div class="form-actions">
+              <button id="saveWeekReview" class="button primary">
+                保存复盘结论
+              </button>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section id="memosView" class="view" hidden>
+        <div class="view-toolbar">
+          <div>
+            <p class="eyebrow">让零散发现以后找得到</p>
+            <h1>感悟库</h1>
+          </div>
+          <div class="memo-search">
+            <input
+              id="memoSearchInput"
+              type="search"
+              maxlength="200"
+              placeholder="搜索内容或标签"
+              aria-label="搜索感悟"
+            />
+            <button id="clearMemoSearch" class="button subtle compact">清除</button>
+          </div>
+        </div>
+
+        <div class="memos-layout">
+          <section class="panel memo-compose-panel">
+            <div class="panel-header compact-header">
+              <div>
+                <p class="eyebrow">快速记录</p>
+                <h2>现在想到什么？</h2>
+              </div>
+            </div>
+            <form id="memoComposeForm" class="memo-compose-form">
+              <textarea
+                id="memoContent"
+                rows="6"
+                maxlength="4000"
+                placeholder="一条记录只保留一个想法，以后更容易搜索和重组。"
+                required
+              ></textarea>
+              <div class="field-row memo-fields">
+                <label>
+                  <span>日期</span>
+                  <input id="memoDate" type="date" required />
+                </label>
+                <label>
+                  <span>标签</span>
+                  <input
+                    id="memoTags"
+                    type="text"
+                    maxlength="300"
+                    placeholder="用逗号分隔"
+                  />
+                </label>
+              </div>
+              <div class="form-actions">
+                <button type="submit" class="button primary">保存感悟</button>
+              </div>
+            </form>
+          </section>
+
+          <section class="memo-feed-section">
+            <div id="memoFilterSummary" class="memo-filter-summary"></div>
+            <div id="memoFeed" class="memo-feed"></div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="editDialog" class="dialog">
+      <form id="editTaskForm" method="dialog">
+        <div class="dialog-header">
+          <div>
+            <p class="eyebrow">调整任务</p>
+            <h2>编辑任务</h2>
+          </div>
+          <button class="dialog-close" value="cancel" aria-label="关闭">×</button>
+        </div>
+        <label>
+          <span>任务名称</span>
+          <input id="editTitle" type="text" maxlength="240" required />
+        </label>
+        <div class="field-row">
+          <label>
+            <span>项目</span>
+            <input id="editProject" type="text" maxlength="80" list="projectOptions" />
+          </label>
+          <label>
+            <span>预估分钟</span>
+            <input id="editEstimate" type="number" min="0" max="1440" step="5" />
+          </label>
+          <label>
+            <span>计划开始</span>
+            <input id="editStart" type="time" />
+          </label>
+        </div>
+        <label>
+          <span>完成标准 / 补充说明</span>
+          <textarea id="editDefinition" rows="3" maxlength="1000"></textarea>
+        </label>
+        <div class="dialog-actions split-actions">
+          <button id="deleteTask" type="button" class="button danger-text">删除</button>
+          <div>
+            <button class="button subtle" value="cancel">取消</button>
+            <button id="saveTaskEdit" type="submit" class="button primary">
+              保存
+            </button>
+          </div>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="closeDayDialog" class="dialog close-day-dialog">
+      <form id="closeDayForm" method="dialog">
+        <div class="dialog-header">
+          <div>
+            <p class="eyebrow">把今天关好</p>
+            <h2>收工复盘</h2>
+            <p>未完成不是红色警告，而是给未来计划留下证据。</p>
+          </div>
+          <button class="dialog-close" value="cancel" aria-label="关闭">×</button>
+        </div>
+        <div id="closeDayTasks" class="close-day-tasks"></div>
+        <label>
+          <span>今天的感悟</span>
+          <textarea
+            id="closeReflection"
+            rows="4"
+            maxlength="8000"
+            placeholder="今天学到了什么？"
+          ></textarea>
+        </label>
+        <fieldset class="mood-picker dialog-mood">
+          <legend>今天的状态</legend>
+          <div>
+            <button type="button" data-close-mood="1">1</button>
+            <button type="button" data-close-mood="2">2</button>
+            <button type="button" data-close-mood="3">3</button>
+            <button type="button" data-close-mood="4">4</button>
+            <button type="button" data-close-mood="5">5</button>
+          </div>
+        </fieldset>
+        <div class="dialog-actions">
+          <button class="button subtle" value="cancel">稍后再说</button>
+          <button id="submitCloseDay" type="submit" class="button dark">
+            确认收工
+          </button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="focusDialog" class="dialog focus-dialog">
+      <form id="focusForm" method="dialog">
+        <div class="dialog-header">
+          <div>
+            <p class="eyebrow">可选的番茄专注</p>
+            <h2>开始一个专注段</h2>
+            <p id="focusTaskName"></p>
+          </div>
+          <button class="dialog-close" value="cancel" aria-label="关闭">×</button>
+        </div>
+        <div class="focus-presets">
+          <button type="button" data-focus-minutes="25" class="is-active">
+            <strong>25</strong><span>短专注</span>
+          </button>
+          <button type="button" data-focus-minutes="50">
+            <strong>50</strong><span>深度工作</span>
+          </button>
+          <button type="button" data-focus-minutes="90">
+            <strong>90</strong><span>长任务</span>
+          </button>
+        </div>
+        <div class="field-row focus-fields">
+          <label>
+            <span>专注分钟</span>
+            <input id="focusMinutes" type="number" min="5" max="180" value="25" />
+          </label>
+          <label>
+            <span>完成后休息</span>
+            <input id="breakMinutes" type="number" min="1" max="60" value="5" />
+          </label>
+        </div>
+        <p class="dialog-hint">
+          提前结束仍会计入实际工作时间；完成整段才会计入专注完成数。
+        </p>
+        <div class="dialog-actions">
+          <button class="button subtle" value="cancel">取消</button>
+          <button id="startFocusButton" type="submit" class="button primary">
+            开始专注
+          </button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="segmentDialog" class="dialog small-dialog">
+      <form id="segmentForm" method="dialog">
+        <div class="dialog-header">
+          <div>
+            <p class="eyebrow">只在误操作时修正</p>
+            <h2>调整工作记录</h2>
+            <p id="segmentTaskName"></p>
+          </div>
+          <button class="dialog-close" value="cancel" aria-label="关闭">×</button>
+        </div>
+        <label>
+          <span>有效工作分钟</span>
+          <input
+            id="segmentDuration"
+            type="number"
+            min="1"
+            max="1440"
+            step="1"
+            required
+          />
+        </label>
+        <div class="dialog-actions split-actions">
+          <button id="deleteSegment" type="button" class="button danger-text">
+            删除这段
+          </button>
+          <div>
+            <button class="button subtle" value="cancel">取消</button>
+            <button id="saveSegment" type="submit" class="button primary">
+              保存修正
+            </button>
+          </div>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="memoDialog" class="dialog">
+      <form id="memoEditForm" method="dialog">
+        <div class="dialog-header">
+          <div>
+            <p class="eyebrow">整理碎片感悟</p>
+            <h2>编辑记录</h2>
+          </div>
+          <button class="dialog-close" value="cancel" aria-label="关闭">×</button>
+        </div>
+        <label>
+          <span>内容</span>
+          <textarea id="memoEditContent" rows="6" maxlength="4000" required></textarea>
+        </label>
+        <div class="field-row memo-fields">
+          <label>
+            <span>日期</span>
+            <input id="memoEditDate" type="date" required />
+          </label>
+          <label>
+            <span>标签</span>
+            <input id="memoEditTags" type="text" maxlength="300" />
+          </label>
+        </div>
+        <label class="pin-option">
+          <input id="memoEditPinned" type="checkbox" />
+          <span>置顶这条记录</span>
+        </label>
+        <div class="dialog-actions split-actions">
+          <button id="deleteMemo" type="button" class="button danger-text">
+            删除
+          </button>
+          <div>
+            <button class="button subtle" value="cancel">取消</button>
+            <button id="saveMemoEdit" type="submit" class="button primary">
+              保存
+            </button>
+          </div>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>
