@@ -37,6 +37,15 @@ const state = {
   loadSequence: 0,
   finishingFocus: false,
   breakUntil: Number(safeStorageGet(STORAGE.breakUntil) || 0),
+  profile: {
+    display_name: "",
+    avatar_data: "",
+    focus_minutes: 25,
+    break_minutes: 5,
+  },
+  routines: [],
+  routineUnlock: "",
+  challenge: null,
 };
 
 const outcomeLabels = {
@@ -216,11 +225,14 @@ function setBusy(button, busy, text = "处理中…") {
 }
 
 function switchView(view) {
-  state.view = ["today", "report", "memos"].includes(view) ? view : "today";
+  state.view = ["today", "report", "memos", "settings"].includes(view)
+    ? view
+    : "today";
   safeStorageSet(STORAGE.view, state.view);
   $("#todayView").hidden = state.view !== "today";
   $("#reportView").hidden = state.view !== "report";
   $("#memosView").hidden = state.view !== "memos";
+  $("#settingsView").hidden = state.view !== "settings";
   $$(".nav-button").forEach((button) => {
     button.classList.toggle("is-active", button.dataset.view === state.view);
   });
@@ -231,6 +243,7 @@ function switchView(view) {
     loadMemos();
     refreshGlobalTimer();
   }
+  if (state.view === "settings") loadSettings();
 }
 
 async function refreshGlobalTimer() {
@@ -289,6 +302,7 @@ function renderDay() {
   updateMoodButtons();
   renderProjectOptions();
   renderTasks();
+  renderTodayRoutines();
   renderSummary();
   renderWorklog();
   renderTodayMemos();
@@ -1392,6 +1406,7 @@ function renderReport() {
   renderProjectStats();
   renderCarryovers();
   renderFocusStats();
+  renderRoutineBoard();
   $("#weekReviewInput").value = state.report.review || "";
   $("#weekReviewStatus").textContent = "";
 }
@@ -1614,10 +1629,379 @@ function changeDate(days) {
   if (state.view === "report") loadReport();
 }
 
+function renderAvatar(node, data, initial) {
+  node.replaceChildren();
+  if (typeof data === "string" && data.startsWith("data:image/")) {
+    const image = document.createElement("img");
+    image.alt = "";
+    image.src = data;
+    node.append(image);
+    return;
+  }
+  node.textContent = initial;
+}
+
+function renderProfile() {
+  const name = state.profile.display_name.trim();
+  const initial = (name || "设").slice(0, 1);
+  $("#headerName").textContent = name || "设置";
+  renderAvatar($("#headerAvatar"), state.profile.avatar_data, initial);
+  if ($("#avatarPreview")) {
+    renderAvatar($("#avatarPreview"), state.profile.avatar_data, initial);
+  }
+  if (state.view === "settings") {
+    $("#displayNameInput").value = name;
+    $("#settingFocusMinutes").value = state.profile.focus_minutes || 25;
+    $("#settingBreakMinutes").value = state.profile.break_minutes || 5;
+  }
+  safeStorageSet(STORAGE.focusMinutes, state.profile.focus_minutes || 25);
+  safeStorageSet(STORAGE.breakMinutes, state.profile.break_minutes || 5);
+}
+
+async function loadSettings() {
+  try {
+    const data = await api("/api/settings");
+    state.profile = data.profile;
+    state.routines = data.routines;
+    renderProfile();
+    if (state.view === "settings") renderRoutineSettings();
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+function renderTodayRoutines() {
+  const routines = state.day?.routines || [];
+  const container = $("#routineTodayList");
+  if (!routines.length) {
+    container.innerHTML = `
+      <div class="routine-empty">
+        还没有每天必做的事。
+        <button type="button" data-action="open-settings">去设置里添加</button>
+      </div>`;
+    return;
+  }
+  const future = state.date > localDateString(new Date());
+  container.innerHTML = routines
+    .map((routine) => {
+      const done = Boolean(routine.completed);
+      return `
+        <article class="routine-item ${done ? "is-done" : ""}" style="--routine:${escapeHtml(routine.color)}">
+          <button class="routine-check" type="button" data-action="toggle-routine"
+            data-routine-id="${routine.id}" data-completed="${done ? "1" : "0"}"
+            ${future ? "disabled" : ""}
+            aria-label="${done ? "取消今天的打卡" : "完成今天的必做"}">✓</button>
+          <div>
+            <h3 class="routine-title">${escapeHtml(routine.title)}</h3>
+            <div class="routine-meta">
+              <span>每日必做</span>
+              ${routine.note ? `<span>${escapeHtml(routine.note)}</span>` : ""}
+              ${routine.estimate_minutes ? `<span>${formatMinutes(routine.estimate_minutes)}</span>` : ""}
+              <span>${future ? "还没到这一天" : "首页不能修改"}</span>
+            </div>
+          </div>
+        </article>`;
+    })
+    .join("");
+}
+
+async function toggleRoutine(routineId, completed) {
+  try {
+    const result = await api("/api/routines/check", {
+      method: "POST",
+      body: JSON.stringify({
+        routine_id: routineId,
+        date: state.date,
+        completed,
+      }),
+    });
+    if (state.day) state.day.routines = result.routines;
+    renderTodayRoutines();
+    notify(completed ? "今日必做已打卡" : "已取消今天的打卡");
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+function renderRoutineSettings() {
+  const locked = state.routines.length > 0 && !state.routineUnlock;
+  $("#unlockRoutines").hidden = !locked;
+  $("#routineCreateForm").hidden = false;
+  $("#routineUnlockNote").hidden = !state.routineUnlock;
+  const list = $("#routineSettingsList");
+  if (!state.routines.length) {
+    list.innerHTML =
+      '<div class="routine-empty">例如：每天锻炼 5 分钟，每天看飞书里的 5 篇生财有术文章。已经生效的项目，改掉或删除前要先答对 3 道题。</div>';
+    return;
+  }
+  list.innerHTML = state.routines
+    .map((routine) =>
+      locked
+        ? `
+          <article class="routine-setting-card">
+            <strong class="routine-title">${escapeHtml(routine.title)}</strong>
+            <div class="routine-meta">
+              ${routine.note ? `<span>${escapeHtml(routine.note)}</span>` : ""}
+              <span>${routine.estimate_minutes ? formatMinutes(routine.estimate_minutes) : "不计入预估"}</span>
+              <span>已锁定</span>
+            </div>
+          </article>`
+        : `
+          <article class="routine-setting-card" data-routine-id="${routine.id}">
+            <label>
+              <span>必做事项</span>
+              <input data-field="title" type="text" maxlength="80" value="${escapeHtml(routine.title)}" />
+            </label>
+            <div class="field-row">
+              <label>
+                <span>补充说明</span>
+                <input data-field="note" type="text" maxlength="200" value="${escapeHtml(routine.note || "")}" />
+              </label>
+              <label>
+                <span>预估分钟</span>
+                <input data-field="estimate" type="number" min="0" max="240" step="5"
+                  value="${Number(routine.estimate_minutes) || 0}" />
+              </label>
+            </div>
+            <div class="form-actions">
+              <button type="button" class="button danger-text" data-routine-action="delete">删除</button>
+              <button type="button" class="button primary" data-routine-action="save">保存这项</button>
+            </div>
+          </article>`,
+    )
+    .join("");
+}
+
+function resizeAvatar(file) {
+  if (!file.type.startsWith("image/")) {
+    return Promise.reject(new Error("请选择图片文件"));
+  }
+  if (file.size > 8_000_000) {
+    return Promise.reject(new Error("图片太大，请换一张较小的"));
+  }
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    const url = URL.createObjectURL(file);
+    image.onload = () => {
+      const scale = Math.min(1, 256 / Math.max(image.width, image.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(image.width * scale));
+      canvas.height = Math.max(1, Math.round(image.height * scale));
+      canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(url);
+      resolve(canvas.toDataURL("image/jpeg", 0.85));
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("这张图片无法读取"));
+    };
+    image.src = url;
+  });
+}
+
+async function saveProfile(event) {
+  event.preventDefault();
+  const button = event.submitter;
+  setBusy(button, true, "保存中…");
+  try {
+    state.profile = await api("/api/settings", {
+      method: "PATCH",
+      body: JSON.stringify({
+        profile: {
+          display_name: $("#displayNameInput").value,
+          avatar_data: state.profile.avatar_data,
+          focus_minutes: $("#settingFocusMinutes").value,
+          break_minutes: $("#settingBreakMinutes").value,
+        },
+      }),
+    });
+    renderProfile();
+    notify("资料已保存");
+  } catch (error) {
+    reportError(error);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function createRoutine(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = event.submitter;
+  setBusy(button, true, "添加中…");
+  try {
+    await api("/api/routines", {
+      method: "POST",
+      body: JSON.stringify({
+        title: $("#routineTitle").value,
+        note: $("#routineNote").value,
+        estimate_minutes: $("#routineEstimate").value,
+      }),
+    });
+    form.reset();
+    $("#routineEstimate").value = "5";
+    await loadSettings();
+    notify("每日必做已添加，从今天开始出现");
+  } catch (error) {
+    reportError(error);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function saveRoutineCard(card) {
+  await api(`/api/routines/${card.dataset.routineId}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      title: $('[data-field="title"]', card).value,
+      note: $('[data-field="note"]', card).value,
+      estimate_minutes: $('[data-field="estimate"]', card).value,
+      unlock_token: state.routineUnlock,
+    }),
+  });
+  await loadSettings();
+  notify("每日必做已更新");
+}
+
+async function deleteRoutineCard(card) {
+  const title = $('[data-field="title"]', card).value;
+  if (!window.confirm(`确定删除每日必做“${title}”吗？已有打卡记录仍会留在复盘里。`)) {
+    return;
+  }
+  await api(`/api/routines/${card.dataset.routineId}`, {
+    method: "DELETE",
+    body: JSON.stringify({ unlock_token: state.routineUnlock }),
+  });
+  await loadSettings();
+  notify("每日必做已删除");
+}
+
+async function openRoutineGate() {
+  try {
+    state.challenge = await api("/api/routines/challenge", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    $("#routineQuestions").innerHTML = state.challenge.questions
+      .map(
+        (question, index) => `
+          <label>
+            <span>第 ${index + 1} 题：${escapeHtml(question.prompt)} = ？</span>
+            <input data-answer-index="${index}" type="number" inputmode="numeric" required />
+          </label>`,
+      )
+      .join("");
+    $("#routineGateDialog").showModal();
+    window.setTimeout(() => $("#routineQuestions input")?.focus(), 0);
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+async function submitRoutineGate(event) {
+  event.preventDefault();
+  if (event.submitter?.value === "cancel") {
+    $("#routineGateDialog").close();
+    return;
+  }
+  const button = $("#submitRoutineGate");
+  setBusy(button, true, "核对中…");
+  try {
+    const answers = $$("[data-answer-index]", $("#routineQuestions")).map(
+      (input) => input.value,
+    );
+    const result = await api("/api/routines/challenge/verify", {
+      method: "POST",
+      body: JSON.stringify({ id: state.challenge.id, answers }),
+    });
+    state.routineUnlock = result.unlock_token;
+    $("#routineGateDialog").close();
+    renderRoutineSettings();
+    notify("3 道题全部正确，现在可以修改");
+  } catch (error) {
+    reportError(error);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+function routineStatusText(status) {
+  return {
+    done: "已完成",
+    missed: "未完成",
+    future: "未到",
+    unset: "尚未开始",
+  }[status] || status;
+}
+
+function renderRoutineBoard() {
+  const routines = state.report?.routines || [];
+  const board = $("#routineBoard");
+  if (!routines.length) {
+    board.innerHTML =
+      '<div class="routine-empty">在设置里添加每日必做后，这里会按周、月、季度显示打卡。</div>';
+    return;
+  }
+  const sample = routines[0].days || [];
+  const axis = sample
+    .map((day) => {
+      const date = parseLocalDate(day.date);
+      let label = "";
+      if (state.reportPeriod === "week") {
+        label = ["一", "二", "三", "四", "五", "六", "日"][
+          date.getDay() === 0 ? 6 : date.getDay() - 1
+        ];
+      } else if (state.reportPeriod === "month") {
+        label = String(date.getDate());
+      } else if (date.getDay() === 1) {
+        label = `${date.getMonth() + 1}/${date.getDate()}`;
+      }
+      return `<span>${escapeHtml(label)}</span>`;
+    })
+    .join("");
+  board.dataset.period = state.reportPeriod;
+  board.innerHTML = `
+    <div class="routine-chart">
+      <div class="routine-names">
+        <span class="routine-axis-spacer"></span>
+        ${routines
+          .map((routine) => {
+            const rate = routine.applicable_count
+              ? Math.round((routine.completed_count / routine.applicable_count) * 100)
+              : 0;
+            return `
+              <div class="routine-chart-name">
+                <strong>${escapeHtml(routine.title)}</strong>
+                <span>${routine.completed_count}/${routine.applicable_count} · ${rate}% · 连续 ${routine.streak} 天${routine.active ? "" : " · 已停用"}</span>
+              </div>`;
+          })
+          .join("")}
+      </div>
+      <div class="routine-scroll">
+        <div class="routine-axis">${axis}</div>
+        ${routines
+          .map(
+            (routine) => `
+              <div class="routine-cells">
+                ${routine.days
+                  .map(
+                    (day) =>
+                      `<span class="routine-cell" data-status="${escapeHtml(day.status)}"
+                        title="${escapeHtml(day.date)} · ${routineStatusText(day.status)}"></span>`,
+                  )
+                  .join("")}
+              </div>`,
+          )
+          .join("")}
+      </div>
+    </div>`;
+}
+
 function bindEvents() {
   $$(".nav-button").forEach((button) => {
     button.addEventListener("click", () => switchView(button.dataset.view));
   });
+  $("#openSettings").addEventListener("click", () => switchView("settings"));
   $("#previousDay").addEventListener("click", () => changeDate(-1));
   $("#nextDay").addEventListener("click", () => changeDate(1));
   $("#backToday").addEventListener("click", () => {
@@ -1755,12 +2139,57 @@ function bindEvents() {
   $("#memoEditForm").addEventListener("submit", saveMemoEdit);
   $("#deleteMemo").addEventListener("click", deleteMemo);
   $("#saveWeekReview").addEventListener("click", saveReportReview);
+
+  $("#routineTodayList").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-action]");
+    if (!button) return;
+    if (button.dataset.action === "open-settings") switchView("settings");
+    if (button.dataset.action === "toggle-routine") {
+      toggleRoutine(
+        Number(button.dataset.routineId),
+        button.dataset.completed !== "1",
+      );
+    }
+  });
+  $("#profileForm").addEventListener("submit", saveProfile);
+  $("#avatarInput").addEventListener("change", async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      state.profile.avatar_data = await resizeAvatar(file);
+      const initial = ($("#displayNameInput").value.trim() || "设").slice(0, 1);
+      renderAvatar($("#avatarPreview"), state.profile.avatar_data, initial);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+  $("#removeAvatar").addEventListener("click", () => {
+    state.profile.avatar_data = "";
+    const initial = ($("#displayNameInput").value.trim() || "设").slice(0, 1);
+    renderAvatar($("#avatarPreview"), "", initial);
+  });
+  $("#unlockRoutines").addEventListener("click", openRoutineGate);
+  $("#routineGateForm").addEventListener("submit", submitRoutineGate);
+  $("#routineCreateForm").addEventListener("submit", createRoutine);
+  $("#routineSettingsList").addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-routine-action]");
+    if (!button) return;
+    const card = button.closest("[data-routine-id]");
+    try {
+      if (button.dataset.routineAction === "save") await saveRoutineCard(card);
+      if (button.dataset.routineAction === "delete") await deleteRoutineCard(card);
+    } catch (error) {
+      reportError(error);
+    }
+  });
 }
 
 function initialize() {
   bindEvents();
   $("#memoDate").value = localDateString(new Date());
   renderBreakBar();
+  loadSettings();
   switchView(state.view);
   window.setInterval(updateLiveTimers, 1000);
 }

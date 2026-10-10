@@ -24,9 +24,15 @@
         <button class="nav-button" data-view="report">复盘</button>
         <button class="nav-button" data-view="memos">感悟库</button>
       </nav>
-      <div class="storage-status" title="数据保存在项目目录 data 文件夹中">
-        <span class="status-dot"></span>
-        SQLite 本地保存
+      <div class="header-tools">
+        <button id="openSettings" class="profile-button" type="button">
+          <span id="headerAvatar" class="header-avatar" aria-hidden="true">设</span>
+          <span id="headerName">设置</span>
+        </button>
+        <div class="storage-status" title="数据保存在项目目录 data 文件夹中">
+          <span class="status-dot"></span>
+          SQLite 本地保存
+        </div>
       </div>
     </header>
 
@@ -54,6 +60,7 @@
 
     <main class="page-shell">
       <section id="todayView" class="view">
+        <div class="view-pin">
         <div class="view-toolbar">
           <div>
             <p class="eyebrow" id="dateEyebrow">今天</p>
@@ -102,9 +109,21 @@
           />
           <span id="daySaveStatus" class="save-status" aria-live="polite"></span>
         </section>
+        </div>
 
         <div class="today-layout">
           <div class="primary-column">
+            <section class="panel routine-today-panel">
+              <div class="panel-header">
+                <div>
+                  <p class="eyebrow">每天都要做</p>
+                  <h2>今日必做</h2>
+                </div>
+                <span class="routine-lock-label">只能在设置中修改</span>
+              </div>
+              <div id="routineTodayList" class="routine-today-list"></div>
+            </section>
+
             <section class="panel task-panel">
               <div class="panel-header">
                 <div>
@@ -273,6 +292,7 @@
       </section>
 
       <section id="reportView" class="view" hidden>
+        <div class="view-pin">
         <div class="view-toolbar">
           <div>
             <p class="eyebrow">从记录中找规律</p>
@@ -314,6 +334,7 @@
             <small>实际与计划的差值</small>
           </article>
         </section>
+        </div>
 
         <div class="week-layout">
           <section class="panel week-chart-panel">
@@ -328,6 +349,21 @@
               </div>
             </div>
             <div id="weekChart" class="week-chart"></div>
+          </section>
+
+          <section class="panel routine-report-panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">每日打卡</p>
+                <h2>必做完成情况</h2>
+              </div>
+              <div class="routine-legend">
+                <span><i data-status="done"></i>完成</span>
+                <span><i data-status="missed"></i>未完成</span>
+                <span><i data-status="future"></i>未到</span>
+              </div>
+            </div>
+            <div id="routineBoard" class="routine-board"></div>
           </section>
 
           <section class="panel heatmap-panel">
@@ -410,6 +446,113 @@
                 保存复盘结论
               </button>
             </div>
+          </section>
+        </div>
+      </section>
+
+      <section id="settingsView" class="view" hidden>
+        <div class="view-toolbar">
+          <div>
+            <p class="eyebrow">只在这里改承诺</p>
+            <h1>设置</h1>
+          </div>
+        </div>
+        <div class="settings-layout">
+          <div class="settings-side">
+            <section class="panel">
+              <div class="panel-header compact-header">
+                <div>
+                  <p class="eyebrow">个人资料</p>
+                  <h2>你是谁</h2>
+                </div>
+              </div>
+              <form id="profileForm" class="settings-form">
+                <div class="avatar-editor">
+                  <span id="avatarPreview" class="avatar-preview">设</span>
+                  <div>
+                    <label class="button subtle compact avatar-upload">
+                      上传头像
+                      <input id="avatarInput" type="file" accept="image/*" hidden />
+                    </label>
+                    <button id="removeAvatar" class="button subtle compact" type="button">
+                      移除
+                    </button>
+                    <p>头像只会保存在本机数据库里。</p>
+                  </div>
+                </div>
+                <label>
+                  <span>显示名称</span>
+                  <input
+                    id="displayNameInput"
+                    type="text"
+                    maxlength="40"
+                    placeholder="例如：勇攀"
+                  />
+                </label>
+                <div class="field-row">
+                  <label>
+                    <span>默认专注分钟</span>
+                    <input id="settingFocusMinutes" type="number" min="5" max="180" value="25" />
+                  </label>
+                  <label>
+                    <span>默认休息分钟</span>
+                    <input id="settingBreakMinutes" type="number" min="1" max="60" value="5" />
+                  </label>
+                </div>
+                <div class="form-actions">
+                  <button type="submit" class="button primary">保存资料</button>
+                </div>
+              </form>
+            </section>
+          </div>
+
+          <section class="panel routine-settings-panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">每日必做</p>
+                <h2>设好之后，每天都会出现</h2>
+              </div>
+              <button id="unlockRoutines" class="button dark compact" type="button" hidden>
+                修改每日必做
+              </button>
+            </div>
+            <p id="routineGuardNote" class="routine-guard-note">
+              这些任务使用专属颜色。首页只能打卡；改掉或删除已经生效的项目，要先答对 3 道包含加减乘除的题。
+            </p>
+            <p id="routineUnlockNote" class="routine-unlock-note" hidden>
+              修改已开启。这段时间结束后会重新锁定。
+            </p>
+            <div id="routineSettingsList" class="routine-settings-list"></div>
+            <form id="routineCreateForm" class="routine-create-form" hidden>
+              <label>
+                <span>必做事项</span>
+                <input
+                  id="routineTitle"
+                  type="text"
+                  maxlength="80"
+                  placeholder="例如：锻炼、阅读生财有术文章"
+                  required
+                />
+              </label>
+              <div class="field-row">
+                <label>
+                  <span>补充说明</span>
+                  <input
+                    id="routineNote"
+                    type="text"
+                    maxlength="200"
+                    placeholder="例如：看飞书里的 5 篇"
+                  />
+                </label>
+                <label>
+                  <span>预估分钟</span>
+                  <input id="routineEstimate" type="number" min="0" max="240" step="5" value="5" />
+                </label>
+              </div>
+              <div class="form-actions">
+                <button type="submit" class="button primary">添加每日必做</button>
+              </div>
+            </form>
           </section>
         </div>
       </section>
@@ -633,6 +776,26 @@
               保存修正
             </button>
           </div>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="routineGateDialog" class="dialog">
+      <form id="routineGateForm" method="dialog">
+        <div class="dialog-header">
+          <div>
+            <p class="eyebrow">防止一时冲动</p>
+            <h2>先答对 3 道题</h2>
+            <p>每道题都包含加减乘除。3 道全部答对后，才能修改每日必做。</p>
+          </div>
+          <button class="dialog-close" value="cancel" aria-label="关闭">×</button>
+        </div>
+        <div id="routineQuestions" class="routine-questions"></div>
+        <div class="dialog-actions">
+          <button class="button subtle" value="cancel">取消</button>
+          <button id="submitRoutineGate" type="submit" class="button primary">
+            提交答案
+          </button>
         </div>
       </form>
     </dialog>

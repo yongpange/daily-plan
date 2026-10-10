@@ -1,8 +1,10 @@
+import json
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
-from server import Database
+from server import AppError, Database, generate_routine_questions
 
 
 class DatabaseTests(unittest.TestCase):
@@ -206,6 +208,102 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(quarter["end"], "2026-12-31")
         self.assertTrue(month["insights"])
         self.assertEqual(len(quarter["days"]), 92)
+
+    def test_daily_routines_lock_changes_behind_four_operation_challenge(self):
+        questions = generate_routine_questions()
+        self.assertEqual(len(questions), 3)
+        for question in questions:
+            for symbol in ("+", "−", "×", "÷"):
+                self.assertIn(symbol, question["prompt"])
+            self.assertIsInstance(question["answer"], int)
+
+        today = date.today().isoformat()
+        created = self.database.create_routine(
+            {
+                "title": "锻炼",
+                "note": "5 分钟",
+                "estimate_minutes": 5,
+            }
+        )
+        second = self.database.create_routine(
+            {"title": "阅读生财有术", "note": "5 篇", "estimate_minutes": 15}
+        )
+        with self.assertRaises(AppError):
+            self.database.update_routine(
+                created["id"], {"title": "改为散步", "estimate_minutes": 1}
+            )
+
+        challenge = self.database.create_routine_challenge()
+        connection = self.database.connect()
+        try:
+            stored = json.loads(
+                connection.execute(
+                    "SELECT questions_json FROM routine_challenges WHERE id = ?",
+                    (challenge["id"],),
+                ).fetchone()["questions_json"]
+            )
+        finally:
+            connection.close()
+        with self.assertRaises(AppError):
+            self.database.verify_routine_challenge(
+                {"id": challenge["id"], "answers": [0, 0, 0]}
+            )
+        passed = self.database.verify_routine_challenge(
+            {
+                "id": challenge["id"],
+                "answers": [item["answer"] for item in stored],
+            }
+        )
+        updated = self.database.update_routine(
+            created["id"],
+            {
+                "title": "每天锻炼",
+                "note": "5 分钟",
+                "estimate_minutes": 5,
+                "unlock_token": passed["unlock_token"],
+            },
+        )
+        self.database.set_routine_check(
+            {"routine_id": created["id"], "date": today, "completed": True}
+        )
+        with self.assertRaises(AppError):
+            self.database.set_routine_check(
+                {
+                    "routine_id": created["id"],
+                    "date": "2099-01-01",
+                    "completed": True,
+                }
+            )
+
+        day = self.database.get_day(today)
+        report = self.database.get_report(today, "week")
+        routine = next(item for item in report["routines"] if item["id"] == created["id"])
+
+        self.assertEqual(updated["title"], "每天锻炼")
+        self.assertEqual(second["title"], "阅读生财有术")
+        self.assertTrue(day["routines"][0]["locked"])
+        self.assertTrue(day["routines"][0]["completed"])
+        self.assertEqual(routine["completed_count"], 1)
+        self.assertTrue(
+            any(item["date"] == today and item["status"] == "done" for item in routine["days"])
+        )
+        self.assertTrue(self.database.get_report(today, "month")["routines"])
+        self.assertTrue(self.database.get_report(today, "quarter")["routines"])
+
+        saved = self.database.save_settings(
+            {
+                "profile": {
+                    "display_name": "勇攀",
+                    "avatar_data": "",
+                    "focus_minutes": 50,
+                    "break_minutes": 10,
+                }
+            }
+        )
+        reopened = Database(self.database.path)
+        self.assertEqual(saved["display_name"], "勇攀")
+        self.assertEqual(reopened.get_settings()["profile"]["focus_minutes"], 50)
+        self.assertEqual(len(reopened.get_settings()["routines"]), 2)
 
 
 if __name__ == "__main__":

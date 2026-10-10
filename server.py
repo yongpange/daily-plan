@@ -4,6 +4,8 @@ import argparse
 import json
 import logging
 import mimetypes
+import random
+import secrets
 import sqlite3
 import threading
 import webbrowser
@@ -34,6 +36,8 @@ REASONS = [
 REASON_VALUES = {item["value"] for item in REASONS}
 OUTCOMES = {"planned", "completed", "carried", "rescheduled", "abandoned"}
 DATE_FORMAT = "%Y-%m-%d"
+ROUTINE_COLOR = "#c47b1a"
+ROUTINE_SYMBOLS = ("+", "−", "×", "÷")
 
 
 class AppError(Exception):
@@ -70,6 +74,40 @@ def seconds_between(start_at: str, end_at: str) -> int:
     start = datetime.fromisoformat(start_at.replace("Z", "+00:00"))
     end = datetime.fromisoformat(end_at.replace("Z", "+00:00"))
     return max(0, int((end - start).total_seconds()))
+
+
+def generate_routine_questions(count: int = 3) -> list[dict]:
+    rng = random.SystemRandom()
+    questions: list[dict] = []
+    prompts: set[str] = set()
+    attempts = 0
+    while len(questions) < count:
+        attempts += 1
+        if attempts > 40:
+            raise AppError("暂时无法生成题目，请再试一次")
+        question = _routine_question(rng)
+        if question["prompt"] in prompts:
+            continue
+        if any(symbol not in question["prompt"] for symbol in ROUTINE_SYMBOLS):
+            continue
+        prompts.add(question["prompt"])
+        questions.append(question)
+    return questions
+
+
+def _routine_question(rng: random.SystemRandom) -> dict:
+    divisor = rng.randint(2, 9)
+    factor = rng.randint(2, 8)
+    inner = rng.randint(2, 12)
+    while (inner * factor) % divisor != 0:
+        inner += 1
+    subtrahend = rng.randint(1, 12)
+    total = inner + subtrahend
+    left = rng.randint(2, max(2, total - 1))
+    right = total - left
+    answer = (inner * factor) // divisor
+    prompt = f"(({left} + {right}) − {subtrahend}) × {factor} ÷ {divisor}"
+    return {"prompt": prompt, "answer": answer}
 
 
 def period_bounds(anchor: str, period: str) -> tuple[date, date]:
@@ -214,6 +252,44 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS memos_by_date
                 ON memos(memo_date DESC, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS routines (
+                    id INTEGER PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    note TEXT NOT NULL DEFAULT '',
+                    estimate_minutes INTEGER NOT NULL DEFAULT 0
+                        CHECK (estimate_minutes >= 0),
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_on TEXT NOT NULL,
+                    deactivated_on TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS routine_checks (
+                    routine_id INTEGER NOT NULL
+                        REFERENCES routines(id) ON DELETE CASCADE,
+                    plan_date TEXT NOT NULL,
+                    completed_at TEXT NOT NULL,
+                    PRIMARY KEY (routine_id, plan_date)
+                );
+
+                CREATE TABLE IF NOT EXISTS routine_challenges (
+                    id TEXT PRIMARY KEY,
+                    questions_json TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    passed INTEGER NOT NULL DEFAULT 0,
+                    unlock_token TEXT,
+                    unlock_expires_at TEXT,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             self._ensure_column(db, "time_segments", "mode", "TEXT NOT NULL DEFAULT 'open'")
@@ -403,6 +479,7 @@ class Database:
                 "active_timer": dict(running) if running else None,
                 "segments": segments,
                 "reasons": REASONS,
+                "routines": self._routines_on(db, clean_date),
             }
 
     def create_entry(self, payload: dict) -> dict:
@@ -1542,6 +1619,7 @@ class Database:
                 },
                 "insights": insights,
                 "review": review["content"] if review else "",
+                "routines": self._routine_report(db, start_date, end_date),
             }
 
     @staticmethod
@@ -1701,6 +1779,415 @@ class Database:
             )
         return {"start": period_start, "content": content}
 
+    def get_settings(self) -> dict:
+        with closing(self.connect()) as db:
+            return {
+                "profile": self._profile(db),
+                "routines": self._active_routines(db),
+            }
+
+    def save_settings(self, payload: dict) -> dict:
+        profile = payload.get("profile", payload)
+        if not isinstance(profile, dict):
+            raise AppError("个人资料格式不正确")
+        display_name = str(profile.get("display_name", "")).strip()[:40]
+        avatar = str(profile.get("avatar_data", "")).strip()
+        if avatar and (
+            len(avatar) > 500_000
+            or not avatar.startswith("data:image/")
+            or ";base64," not in avatar
+        ):
+            raise AppError("头像需要是较小的图片")
+        focus_minutes = as_non_negative_int(
+            profile.get("focus_minutes", 25), "专注时长"
+        )
+        break_minutes = as_non_negative_int(
+            profile.get("break_minutes", 5), "休息时长"
+        )
+        if focus_minutes < 5 or focus_minutes > 180:
+            raise AppError("默认专注时长需要在 5 到 180 分钟之间")
+        if break_minutes < 1 or break_minutes > 60:
+            raise AppError("默认休息时长需要在 1 到 60 分钟之间")
+        now = utc_now()
+        values = {
+            "display_name": display_name,
+            "avatar_data": avatar,
+            "focus_minutes": str(focus_minutes),
+            "break_minutes": str(break_minutes),
+        }
+        with closing(self.connect()) as db, db:
+            for key, value in values.items():
+                db.execute(
+                    """
+                    INSERT INTO app_settings(key, value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value,
+                        updated_at = excluded.updated_at
+                    """,
+                    (key, value, now),
+                )
+            return self._profile(db)
+
+    def create_routine(self, payload: dict) -> dict:
+        title, note, estimate = self._routine_fields(payload)
+        now = utc_now()
+        today = date.today().isoformat()
+        with closing(self.connect()) as db, db:
+            sort_order = db.execute(
+                "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM routines"
+            ).fetchone()[0]
+            cursor = db.execute(
+                """
+                INSERT INTO routines(
+                    title, note, estimate_minutes, sort_order, active,
+                    created_on, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                """,
+                (title, note, estimate, sort_order, today, now, now),
+            )
+            return self._routine_by_id(db, int(cursor.lastrowid))
+
+    def update_routine(self, routine_id: int, payload: dict) -> dict:
+        title, note, estimate = self._routine_fields(payload, partial=True)
+        with closing(self.connect()) as db, db:
+            self._require_routine_unlock(db, payload.get("unlock_token"))
+            current = db.execute(
+                "SELECT * FROM routines WHERE id = ? AND active = 1",
+                (routine_id,),
+            ).fetchone()
+            if not current:
+                raise AppError("没有找到这项每日必做", HTTPStatus.NOT_FOUND)
+            db.execute(
+                """
+                UPDATE routines
+                SET title = ?, note = ?, estimate_minutes = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    title if title is not None else current["title"],
+                    note if note is not None else current["note"],
+                    estimate
+                    if estimate is not None
+                    else current["estimate_minutes"],
+                    utc_now(),
+                    routine_id,
+                ),
+            )
+            return self._routine_by_id(db, routine_id)
+
+    def delete_routine(self, routine_id: int, unlock_token: object) -> None:
+        with closing(self.connect()) as db, db:
+            self._require_routine_unlock(db, unlock_token)
+            cursor = db.execute(
+                """
+                UPDATE routines
+                SET active = 0, deactivated_on = ?, updated_at = ?
+                WHERE id = ? AND active = 1
+                """,
+                (date.today().isoformat(), utc_now(), routine_id),
+            )
+            if cursor.rowcount == 0:
+                raise AppError("没有找到这项每日必做", HTTPStatus.NOT_FOUND)
+
+    def create_routine_challenge(self) -> dict:
+        questions = generate_routine_questions()
+        challenge_id = secrets.token_urlsafe(18)
+        now = datetime.now(timezone.utc)
+        expires = (now + timedelta(minutes=10)).isoformat(timespec="seconds").replace(
+            "+00:00", "Z"
+        )
+        with closing(self.connect()) as db, db:
+            db.execute(
+                "DELETE FROM routine_challenges WHERE expires_at < ?",
+                (utc_now(),),
+            )
+            db.execute(
+                """
+                INSERT INTO routine_challenges(
+                    id, questions_json, expires_at, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    challenge_id,
+                    json.dumps(questions, ensure_ascii=False),
+                    expires,
+                    utc_now(),
+                ),
+            )
+        return {
+            "id": challenge_id,
+            "expires_at": expires,
+            "questions": [
+                {"prompt": item["prompt"]} for item in questions
+            ],
+        }
+
+    def verify_routine_challenge(self, payload: dict) -> dict:
+        challenge_id = str(payload.get("id", "")).strip()
+        answers = payload.get("answers")
+        if not challenge_id or not isinstance(answers, list):
+            raise AppError("请完成全部题目")
+        with closing(self.connect()) as db, db:
+            row = db.execute(
+                "SELECT * FROM routine_challenges WHERE id = ?",
+                (challenge_id,),
+            ).fetchone()
+            if not row or row["expires_at"] < utc_now():
+                raise AppError("这组题目已过期，请重新出题")
+            questions = json.loads(row["questions_json"])
+            if len(answers) != len(questions):
+                raise AppError("请完成全部题目")
+            parsed = [_as_whole_number(item, "答案") for item in answers]
+            if any(parsed[index] != int(item["answer"]) for index, item in enumerate(questions)):
+                raise AppError("三道题需要全部答对，才能修改每日必做")
+            token = secrets.token_urlsafe(24)
+            unlock_expires = (
+                datetime.now(timezone.utc) + timedelta(minutes=10)
+            ).isoformat(timespec="seconds").replace("+00:00", "Z")
+            db.execute(
+                """
+                UPDATE routine_challenges
+                SET passed = 1, unlock_token = ?, unlock_expires_at = ?
+                WHERE id = ?
+                """,
+                (token, unlock_expires, challenge_id),
+            )
+            return {"unlocked": True, "unlock_token": token, "expires_at": unlock_expires}
+
+    def set_routine_check(self, payload: dict) -> dict:
+        routine_id = as_non_negative_int(payload.get("routine_id"), "每日必做")
+        plan_date = valid_date(payload.get("date"))
+        if plan_date > date.today().isoformat():
+            raise AppError("还没到这一天，不能提前打卡")
+        completed = bool(payload.get("completed"))
+        with closing(self.connect()) as db, db:
+            routine = db.execute(
+                "SELECT * FROM routines WHERE id = ?", (routine_id,)
+            ).fetchone()
+            if not routine or not routine["active"]:
+                raise AppError("没有找到这项每日必做", HTTPStatus.NOT_FOUND)
+            if plan_date < routine["created_on"]:
+                raise AppError("这一天还没有这项每日必做")
+            if routine["deactivated_on"] and plan_date >= routine["deactivated_on"]:
+                raise AppError("这项每日必做已经停用")
+            if completed:
+                db.execute(
+                    """
+                    INSERT INTO routine_checks(routine_id, plan_date, completed_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(routine_id, plan_date) DO UPDATE SET
+                        completed_at = excluded.completed_at
+                    """,
+                    (routine_id, plan_date, utc_now()),
+                )
+            else:
+                db.execute(
+                    "DELETE FROM routine_checks WHERE routine_id = ? AND plan_date = ?",
+                    (routine_id, plan_date),
+                )
+            return {"date": plan_date, "routines": self._routines_on(db, plan_date)}
+
+    @staticmethod
+    def _profile(db: sqlite3.Connection) -> dict:
+        rows = {
+            row["key"]: row["value"]
+            for row in db.execute("SELECT key, value FROM app_settings")
+        }
+        try:
+            focus_minutes = int(rows.get("focus_minutes", "25"))
+        except ValueError:
+            focus_minutes = 25
+        try:
+            break_minutes = int(rows.get("break_minutes", "5"))
+        except ValueError:
+            break_minutes = 5
+        return {
+            "display_name": rows.get("display_name", ""),
+            "avatar_data": rows.get("avatar_data", ""),
+            "focus_minutes": focus_minutes,
+            "break_minutes": break_minutes,
+        }
+
+    @staticmethod
+    def _routine_fields(
+        payload: dict, partial: bool = False
+    ) -> tuple[str | None, str | None, int | None]:
+        has_title = "title" in payload or not partial
+        title = str(payload.get("title", "")).strip() if has_title else None
+        if title is not None:
+            if not title:
+                raise AppError("先写下每日必做的名称")
+            if len(title) > 80:
+                raise AppError("每日必做的名称请控制在 80 个字以内")
+        note = str(payload.get("note", "")).strip()[:200] if "note" in payload or not partial else None
+        estimate = None
+        if "estimate_minutes" in payload or not partial:
+            estimate = as_non_negative_int(
+                payload.get("estimate_minutes", 0), "预估分钟"
+            )
+            if estimate > 240:
+                raise AppError("单项每日必做的预估不要超过 240 分钟")
+        return title, note, estimate
+
+    def _require_routine_unlock(self, db: sqlite3.Connection, token: object) -> None:
+        if not isinstance(token, str) or len(token) < 20:
+            raise AppError("修改每日必做前，需要先答对 3 道题")
+        row = db.execute(
+            """
+            SELECT unlock_expires_at FROM routine_challenges
+            WHERE unlock_token = ? AND passed = 1
+            """,
+            (token,),
+        ).fetchone()
+        if not row or not row["unlock_expires_at"] or row["unlock_expires_at"] < utc_now():
+            raise AppError("修改时间已过，请重新答题")
+
+    @staticmethod
+    def _active_routines(db: sqlite3.Connection) -> list[dict]:
+        return [
+            Database._public_routine(row)
+            for row in db.execute(
+                """
+                SELECT * FROM routines
+                WHERE active = 1
+                ORDER BY sort_order, id
+                """
+            )
+        ]
+
+    @staticmethod
+    def _routine_by_id(db: sqlite3.Connection, routine_id: int) -> dict:
+        row = db.execute(
+            "SELECT * FROM routines WHERE id = ?", (routine_id,)
+        ).fetchone()
+        if not row:
+            raise AppError("没有找到这项每日必做", HTTPStatus.NOT_FOUND)
+        return Database._public_routine(row)
+
+    @staticmethod
+    def _public_routine(row: sqlite3.Row, completed: bool = False) -> dict:
+        return {
+            "id": int(row["id"]),
+            "title": row["title"],
+            "note": row["note"],
+            "estimate_minutes": int(row["estimate_minutes"]),
+            "color": ROUTINE_COLOR,
+            "created_on": row["created_on"],
+            "active": bool(row["active"]),
+            "completed": completed,
+            "locked": True,
+        }
+
+    @staticmethod
+    def _routines_on(db: sqlite3.Connection, plan_date: str) -> list[dict]:
+        completed = {
+            int(row["routine_id"])
+            for row in db.execute(
+                "SELECT routine_id FROM routine_checks WHERE plan_date = ?",
+                (plan_date,),
+            )
+        }
+        routines = []
+        for row in db.execute(
+            """
+            SELECT * FROM routines
+            WHERE active = 1 AND created_on <= ?
+            ORDER BY sort_order, id
+            """,
+            (plan_date,),
+        ):
+            routines.append(
+                Database._public_routine(row, int(row["id"]) in completed)
+            )
+        return routines
+
+    @staticmethod
+    def _routine_report(
+        db: sqlite3.Connection, start_date: date, end_date: date
+    ) -> list[dict]:
+        today = date.today()
+        start = start_date.isoformat()
+        end = end_date.isoformat()
+        routines = db.execute("SELECT * FROM routines ORDER BY sort_order, id").fetchall()
+        result = []
+        for routine in routines:
+            created = datetime.strptime(routine["created_on"], DATE_FORMAT).date()
+            deactivated = (
+                datetime.strptime(routine["deactivated_on"], DATE_FORMAT).date()
+                if routine["deactivated_on"]
+                else None
+            )
+            if created > end_date or (deactivated and deactivated <= start_date):
+                continue
+            done_dates = {
+                row["plan_date"]
+                for row in db.execute(
+                    """
+                    SELECT plan_date FROM routine_checks
+                    WHERE routine_id = ? AND plan_date BETWEEN ? AND ?
+                    """,
+                    (routine["id"], start, end),
+                )
+            }
+            all_done = {
+                row["plan_date"]
+                for row in db.execute(
+                    "SELECT plan_date FROM routine_checks WHERE routine_id = ?",
+                    (routine["id"],),
+                )
+            }
+            days = []
+            completed = 0
+            applicable = 0
+            cursor = start_date
+            while cursor <= end_date:
+                if cursor < created or (deactivated and cursor >= deactivated):
+                    status = "unset"
+                elif cursor > today:
+                    status = "future"
+                elif cursor.isoformat() in done_dates:
+                    status = "done"
+                    completed += 1
+                    applicable += 1
+                else:
+                    status = "missed"
+                    applicable += 1
+                days.append({"date": cursor.isoformat(), "status": status})
+                cursor += timedelta(days=1)
+            if applicable == 0 and not routine["active"]:
+                continue
+            streak = 0
+            streak_cursor = today if today.isoformat() in all_done else today - timedelta(days=1)
+            while streak_cursor >= created and streak_cursor.isoformat() in all_done:
+                streak += 1
+                streak_cursor -= timedelta(days=1)
+            result.append(
+                {
+                    "id": int(routine["id"]),
+                    "title": routine["title"],
+                    "note": routine["note"],
+                    "estimate_minutes": int(routine["estimate_minutes"]),
+                    "color": ROUTINE_COLOR,
+                    "active": bool(routine["active"]),
+                    "completed_count": completed,
+                    "applicable_count": applicable,
+                    "streak": streak,
+                    "days": days,
+                }
+            )
+        return result
+
+
+def _as_whole_number(value: object, field_name: str) -> int:
+    if isinstance(value, bool):
+        raise AppError(f"{field_name}需要填写整数")
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise AppError(f"{field_name}需要填写整数") from exc
+    return parsed
+
 
 class RequestHandler(BaseHTTPRequestHandler):
     server_version = "DailyPlan"
@@ -1825,6 +2312,39 @@ class RequestHandler(BaseHTTPRequestHandler):
         if method == "POST" and path == "/api/review":
             self._json(self.database.save_period_review(self._body()))
             return
+        if method == "GET" and path == "/api/settings":
+            self._json(self.database.get_settings())
+            return
+        if method == "PATCH" and path == "/api/settings":
+            self._json(self.database.save_settings(self._body()))
+            return
+        if method == "POST" and path == "/api/routines/challenge":
+            self._json(self.database.create_routine_challenge())
+            return
+        if method == "POST" and path == "/api/routines/challenge/verify":
+            self._json(self.database.verify_routine_challenge(self._body()))
+            return
+        if method == "POST" and path == "/api/routines/check":
+            self._json(self.database.set_routine_check(self._body()))
+            return
+        if method == "POST" and path == "/api/routines":
+            self._json(self.database.create_routine(self._body()), HTTPStatus.CREATED)
+            return
+
+        routine_prefix = "/api/routines/"
+        if path.startswith(routine_prefix):
+            suffix = path[len(routine_prefix) :].strip("/")
+            if "/" not in suffix and suffix.isdigit():
+                routine_id = int(suffix)
+                if method == "PATCH":
+                    self._json(self.database.update_routine(routine_id, self._body()))
+                    return
+                if method == "DELETE":
+                    self.database.delete_routine(
+                        routine_id, self._body().get("unlock_token")
+                    )
+                    self._json({"deleted": True})
+                    return
 
         entry_prefix = "/api/entries/"
         if path.startswith(entry_prefix):
