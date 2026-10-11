@@ -305,6 +305,155 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(reopened.get_settings()["profile"]["focus_minutes"], 50)
         self.assertEqual(len(reopened.get_settings()["routines"]), 2)
 
+    def test_note_images_round_trip_and_recent_tags(self):
+        tiny_png = (
+            "data:image/png;base64,"
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        )
+        with self.assertRaises(AppError):
+            self.database.create_memo({"date": self.today, "content": "   "})
+
+        memo = self.database.create_memo(
+            {"date": self.today, "content": "", "has_images": True, "tags": ""}
+        )
+        saved = self.database.create_note_image(
+            {
+                "owner_type": "memo",
+                "owner_key": str(memo["id"]),
+                "original": tiny_png,
+                "thumbnail": tiny_png,
+                "width": 1,
+                "height": 1,
+            }
+        )
+        original, content_type = self.database.read_note_image(saved["id"])
+        thumbnail, thumbnail_type = self.database.read_note_image(
+            saved["id"], thumbnail=True
+        )
+        self.assertEqual(content_type, "image/png")
+        self.assertEqual(thumbnail_type, "image/jpeg")
+        self.assertTrue(original.startswith(b"\x89PNG"))
+        self.assertEqual(thumbnail, original)
+        self.assertTrue((self.database.image_dir / str(saved["id"])).is_file())
+
+        listed = next(
+            item for item in self.database.list_memos("") if item["id"] == memo["id"]
+        )
+        self.assertEqual(listed["images"][0]["id"], saved["id"])
+        cleared = self.database.update_memo(memo["id"], {"content": ""})
+        self.assertEqual(cleared["content"], "")
+        self.assertEqual(cleared["images"][0]["id"], saved["id"])
+
+        day_image = self.database.create_note_image(
+            {
+                "owner_type": "day",
+                "owner_key": self.today,
+                "original": tiny_png,
+                "thumbnail": tiny_png,
+                "width": 1,
+                "height": 1,
+            }
+        )
+        self.assertEqual(
+            self.database.get_day(self.today)["day"]["images"][0]["id"],
+            day_image["id"],
+        )
+        self.database.save_day(
+            {"date": self.today, "reflection": "今天把发现画了下来"}
+        )
+        daily = next(
+            item
+            for item in self.database.list_memos("画了下来")
+            if item["kind"] == "daily"
+        )
+        self.assertEqual(daily["images"][0]["id"], day_image["id"])
+        listed_daily = next(
+            item
+            for item in self.database.list_memos("")
+            if item["kind"] == "daily" and item["memo_date"] == self.today
+        )
+        self.assertEqual(listed_daily["images"][0]["id"], day_image["id"])
+
+        self.database.delete_note_image(saved["id"])
+        self.assertFalse((self.database.image_dir / str(saved["id"])).exists())
+        self.assertFalse((self.database.image_dir / f"{saved['id']}.thumb").exists())
+        with self.assertRaises(AppError):
+            self.database.read_note_image(saved["id"])
+
+        doomed = self.database.create_memo(
+            {"date": self.today, "content": "待删除", "has_images": True}
+        )
+        doomed_image = self.database.create_note_image(
+            {
+                "owner_type": "memo",
+                "owner_key": doomed["id"],
+                "original": tiny_png,
+                "thumbnail": tiny_png,
+                "width": 1,
+                "height": 1,
+            }
+        )
+        self.database.delete_memo(doomed["id"])
+        self.assertFalse((self.database.image_dir / str(doomed_image["id"])).exists())
+
+        with self.assertRaises(AppError):
+            self.database.create_note_image(
+                {
+                    "owner_type": "day",
+                    "owner_key": self.today,
+                    "original": "not-an-image",
+                    "thumbnail": tiny_png,
+                }
+            )
+        for _ in range(8):
+            self.database.create_note_image(
+                {
+                    "owner_type": "day",
+                    "owner_key": self.today,
+                    "original": tiny_png,
+                    "thumbnail": tiny_png,
+                    "width": 1,
+                    "height": 1,
+                }
+            )
+        with self.assertRaises(AppError):
+            self.database.create_note_image(
+                {
+                    "owner_type": "day",
+                    "owner_key": self.today,
+                    "original": tiny_png,
+                    "thumbnail": tiny_png,
+                    "width": 1,
+                    "height": 1,
+                }
+            )
+
+        specs = [
+            ("旧主题", "2026-10-01T00:00:00Z"),
+            ("估时", "2026-10-02T00:00:00Z"),
+            ("估时", "2026-10-08T00:00:00Z"),
+            ("产品", "2026-10-09T00:00:00Z"),
+            ("复盘", "2026-10-10T00:00:00Z"),
+            ("估时", "2026-10-11T00:00:00Z"),
+        ]
+        created_ids = [
+            self.database.create_memo(
+                {"date": self.today, "content": tag, "tags": tag}
+            )["id"]
+            for tag, _created_at in specs
+        ]
+        connection = self.database.connect()
+        try:
+            for memo_id, (_tag, created_at) in zip(created_ids, specs):
+                connection.execute(
+                    "UPDATE memos SET created_at = ? WHERE id = ?",
+                    (created_at, memo_id),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.assertEqual(self.database.suggested_tags(), ["估时", "复盘", "产品"])
 
 if __name__ == "__main__":
     unittest.main()

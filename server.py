@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import json
 import logging
 import mimetypes
 import random
+import re
 import secrets
 import sqlite3
 import threading
@@ -253,6 +256,20 @@ class Database:
                 CREATE INDEX IF NOT EXISTS memos_by_date
                 ON memos(memo_date DESC, created_at DESC);
 
+                CREATE TABLE IF NOT EXISTS note_images (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_type TEXT NOT NULL
+                        CHECK (owner_type IN ('day', 'memo')),
+                    owner_key TEXT NOT NULL,
+                    content_type TEXT NOT NULL,
+                    width INTEGER,
+                    height INTEGER,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS note_images_by_owner
+                ON note_images(owner_type, owner_key, id);
+
                 CREATE TABLE IF NOT EXISTS app_settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
@@ -300,6 +317,46 @@ class Database:
                 "focus_completed",
                 "INTEGER NOT NULL DEFAULT 0",
             )
+            self._ensure_image_ids(db)
+
+    @staticmethod
+    def _ensure_image_ids(db: sqlite3.Connection) -> None:
+        row = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'note_images'"
+        ).fetchone()
+        if not row or "AUTOINCREMENT" in row["sql"].upper():
+            return
+        db.execute("ALTER TABLE note_images RENAME TO note_images_old")
+        db.execute(
+            """
+            CREATE TABLE note_images (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_type TEXT NOT NULL
+                    CHECK (owner_type IN ('day', 'memo')),
+                owner_key TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                width INTEGER,
+                height INTEGER,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO note_images(
+                id, owner_type, owner_key, content_type, width, height, created_at
+            )
+            SELECT id, owner_type, owner_key, content_type, width, height, created_at
+            FROM note_images_old
+            """
+        )
+        db.execute("DROP TABLE note_images_old")
+        db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS note_images_by_owner
+            ON note_images(owner_type, owner_key, id)
+            """
+        )
 
     @staticmethod
     def _ensure_column(
@@ -463,9 +520,8 @@ class Database:
                     (clean_date,),
                 )
             ]
-            return {
-                "date": clean_date,
-                "day": dict(day)
+            day_record = (
+                dict(day)
                 if day
                 else {
                     "plan_date": clean_date,
@@ -473,7 +529,12 @@ class Database:
                     "reflection": "",
                     "mood": None,
                     "closed_at": None,
-                },
+                }
+            )
+            day_record["images"] = self._images_for(db, "day", clean_date)
+            return {
+                "date": clean_date,
+                "day": day_record,
                 "entries": [self._entry(db, int(row["id"])) for row in entries],
                 "projects": projects,
                 "active_timer": dict(running) if running else None,
@@ -844,8 +905,33 @@ class Database:
                     params,
                 )
             ]
-            if clean_query and not memo_date:
-                reflections = [
+            if not memo_date:
+                if clean_query:
+                    daily_rows = db.execute(
+                        """
+                        SELECT plan_date, reflection, updated_at
+                        FROM days
+                        WHERE reflection <> '' AND reflection LIKE ?
+                        ORDER BY plan_date DESC
+                        LIMIT 50
+                        """,
+                        (f"%{clean_query}%",),
+                    )
+                else:
+                    daily_rows = db.execute(
+                        """
+                        SELECT ni.owner_key AS plan_date,
+                               COALESCE(d.reflection, '') AS reflection,
+                               COALESCE(d.updated_at, MAX(ni.created_at)) AS updated_at
+                        FROM note_images ni
+                        LEFT JOIN days d ON d.plan_date = ni.owner_key
+                        WHERE ni.owner_type = 'day'
+                        GROUP BY ni.owner_key
+                        ORDER BY ni.owner_key DESC
+                        LIMIT 50
+                        """
+                    )
+                memos.extend(
                     {
                         "id": row["plan_date"],
                         "memo_date": row["plan_date"],
@@ -856,35 +942,38 @@ class Database:
                         "updated_at": row["updated_at"],
                         "kind": "daily",
                     }
-                    for row in db.execute(
-                        """
-                        SELECT plan_date, reflection, updated_at
-                        FROM days
-                        WHERE reflection <> '' AND reflection LIKE ?
-                        ORDER BY plan_date DESC
-                        LIMIT 50
-                        """,
-                        (f"%{clean_query}%",),
-                    )
-                ]
-                memos.extend(reflections)
+                    for row in daily_rows
+                )
                 memos.sort(
                     key=lambda item: (
                         int(item["pinned"]),
                         item["memo_date"],
-                        item["created_at"],
+                        item["created_at"] or "",
                     ),
                     reverse=True,
                 )
-            return memos[:limit]
+            memos = memos[:limit]
+            self._attach_images(
+                db,
+                [item for item in memos if item["kind"] == "memo"],
+                "memo",
+                lambda item: str(item["id"]),
+            )
+            self._attach_images(
+                db,
+                [item for item in memos if item["kind"] == "daily"],
+                "day",
+                lambda item: str(item["memo_date"]),
+            )
+            return memos
 
     def create_memo(self, payload: dict) -> dict:
         memo_date = valid_date(
             payload.get("date") or date.today().isoformat(), "记录日期"
         )
         content = str(payload.get("content", "")).strip()
-        if not content:
-            raise AppError("先写下一点内容")
+        if not content and not payload.get("has_images"):
+            raise AppError("先写下一点内容，或添加一张图片")
         if len(content) > 4000:
             raise AppError("单条感悟请控制在 4000 个字以内")
         tags = str(payload.get("tags", "")).strip()[:300]
@@ -898,11 +987,14 @@ class Database:
                 """,
                 (memo_date, content, tags, now, now),
             )
-            row = db.execute(
-                "SELECT *, 'memo' AS kind FROM memos WHERE id = ?",
-                (cursor.lastrowid,),
-            ).fetchone()
-            return dict(row)
+            created = dict(
+                db.execute(
+                    "SELECT *, 'memo' AS kind FROM memos WHERE id = ?",
+                    (cursor.lastrowid,),
+                ).fetchone()
+            )
+            created["images"] = []
+            return created
 
     def update_memo(self, memo_id: int, payload: dict) -> dict:
         with closing(self.connect()) as db, db:
@@ -913,7 +1005,17 @@ class Database:
                 raise AppError("没有找到这条感悟", HTTPStatus.NOT_FOUND)
             content = str(payload.get("content", current["content"])).strip()
             if not content:
-                raise AppError("感悟内容不能为空")
+                has_images = db.execute(
+                    """
+                    SELECT EXISTS(
+                        SELECT 1 FROM note_images
+                        WHERE owner_type = 'memo' AND owner_key = ?
+                    )
+                    """,
+                    (str(memo_id),),
+                ).fetchone()[0]
+                if not has_images:
+                    raise AppError("感悟内容不能为空")
             tags = str(payload.get("tags", current["tags"])).strip()[:300]
             pinned = int(bool(payload.get("pinned", current["pinned"])))
             memo_date = valid_date(
@@ -928,16 +1030,219 @@ class Database:
                 """,
                 (memo_date, content[:4000], tags, pinned, utc_now(), memo_id),
             )
-            row = db.execute(
-                "SELECT *, 'memo' AS kind FROM memos WHERE id = ?", (memo_id,)
-            ).fetchone()
-            return dict(row)
+            updated = dict(
+                db.execute(
+                    "SELECT *, 'memo' AS kind FROM memos WHERE id = ?", (memo_id,)
+                ).fetchone()
+            )
+            self._attach_images(db, [updated], "memo", lambda item: str(item["id"]))
+            return updated
 
     def delete_memo(self, memo_id: int) -> None:
         with closing(self.connect()) as db, db:
+            image_ids = [
+                int(row["id"])
+                for row in db.execute(
+                    """
+                    SELECT id FROM note_images
+                    WHERE owner_type = 'memo' AND owner_key = ?
+                    """,
+                    (str(memo_id),),
+                )
+            ]
             cursor = db.execute("DELETE FROM memos WHERE id = ?", (memo_id,))
             if cursor.rowcount == 0:
                 raise AppError("没有找到这条感悟", HTTPStatus.NOT_FOUND)
+            db.execute(
+                "DELETE FROM note_images WHERE owner_type = 'memo' AND owner_key = ?",
+                (str(memo_id),),
+            )
+        for image_id in image_ids:
+            self._remove_image_files(image_id)
+
+    @property
+    def image_dir(self) -> Path:
+        return self.path.parent / "images"
+
+    def create_note_image(self, payload: dict) -> dict:
+        owner_type = str(payload.get("owner_type", ""))
+        if owner_type not in {"day", "memo"}:
+            raise AppError("图片所属记录不正确")
+        owner_key = str(payload.get("owner_key", "")).strip()
+        if owner_type == "day":
+            owner_key = valid_date(owner_key)
+        elif not owner_key.isdigit():
+            raise AppError("图片所属记录不正确")
+        content_type, original = self._decode_image(
+            payload.get("original"), "原图", 8_000_000
+        )
+        _, thumbnail = self._decode_image(
+            payload.get("thumbnail"), "缩略图", 500_000
+        )
+        width = payload.get("width")
+        height = payload.get("height")
+        width = int(width) if isinstance(width, int) and width > 0 else None
+        height = int(height) if isinstance(height, int) and height > 0 else None
+        now = utc_now()
+        with closing(self.connect()) as db, db:
+            if owner_type == "memo":
+                exists = db.execute(
+                    "SELECT EXISTS(SELECT 1 FROM memos WHERE id = ?)",
+                    (int(owner_key),),
+                ).fetchone()[0]
+                if not exists:
+                    raise AppError("没有找到这条感悟", HTTPStatus.NOT_FOUND)
+            count = db.execute(
+                """
+                SELECT COUNT(*) FROM note_images
+                WHERE owner_type = ? AND owner_key = ?
+                """,
+                (owner_type, owner_key),
+            ).fetchone()[0]
+            if count >= 9:
+                raise AppError("一条记录最多保存 9 张图片")
+            cursor = db.execute(
+                """
+                INSERT INTO note_images(
+                    owner_type, owner_key, content_type, width, height, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (owner_type, owner_key, content_type, width, height, now),
+            )
+            image_id = int(cursor.lastrowid)
+        try:
+            self.image_dir.mkdir(parents=True, exist_ok=True)
+            (self.image_dir / str(image_id)).write_bytes(original)
+            (self.image_dir / f"{image_id}.thumb").write_bytes(thumbnail)
+        except OSError as exc:
+            with closing(self.connect()) as db, db:
+                db.execute("DELETE FROM note_images WHERE id = ?", (image_id,))
+            raise AppError("图片没有保存成功") from exc
+        return {
+            "id": image_id,
+            "width": width,
+            "height": height,
+            "owner_type": owner_type,
+            "owner_key": owner_key,
+        }
+
+    def delete_note_image(self, image_id: int) -> None:
+        with closing(self.connect()) as db, db:
+            cursor = db.execute("DELETE FROM note_images WHERE id = ?", (image_id,))
+            if cursor.rowcount == 0:
+                raise AppError("没有找到这张图片", HTTPStatus.NOT_FOUND)
+        self._remove_image_files(image_id)
+
+    def read_note_image(self, image_id: int, thumbnail: bool = False) -> tuple[bytes, str]:
+        with closing(self.connect()) as db:
+            row = db.execute(
+                "SELECT content_type FROM note_images WHERE id = ?", (image_id,)
+            ).fetchone()
+        if not row:
+            raise AppError("没有找到这张图片", HTTPStatus.NOT_FOUND)
+        path = self.image_dir / (f"{image_id}.thumb" if thumbnail else str(image_id))
+        if not path.is_file():
+            raise AppError("没有找到这张图片", HTTPStatus.NOT_FOUND)
+        content_type = "image/jpeg" if thumbnail else row["content_type"]
+        return path.read_bytes(), content_type
+
+    def suggested_tags(self, limit: int = 3) -> list[str]:
+        with closing(self.connect()) as db:
+            rows = db.execute(
+                """
+                SELECT tags, created_at FROM memos
+                WHERE tags <> ''
+                ORDER BY created_at DESC, id DESC
+                LIMIT 200
+                """
+            ).fetchall()
+        scores: dict[str, float] = {}
+        latest: dict[str, str] = {}
+        for index, row in enumerate(rows):
+            weight = 1 + (200 - index) / 200
+            for tag in re.split(r"[,，\s]+", row["tags"]):
+                clean = tag.strip()
+                if not clean:
+                    continue
+                scores[clean] = scores.get(clean, 0) + weight
+                latest.setdefault(clean, row["created_at"])
+        ranked = sorted(
+            scores,
+            key=lambda tag: (scores[tag], latest.get(tag, "")),
+            reverse=True,
+        )
+        return ranked[:limit]
+
+    def _remove_image_files(self, image_id: int) -> None:
+        for path in (
+            self.image_dir / str(image_id),
+            self.image_dir / f"{image_id}.thumb",
+        ):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                logging.exception("删除图片文件失败：%s", path)
+
+    @staticmethod
+    def _decode_image(value: object, field_name: str, max_bytes: int) -> tuple[str, bytes]:
+        if not isinstance(value, str) or not value.startswith("data:image/"):
+            raise AppError(f"{field_name}格式不正确")
+        header, separator, data = value.partition(",")
+        if not separator or ";base64" not in header:
+            raise AppError(f"{field_name}格式不正确")
+        content_type = header[5:].split(";", 1)[0].lower()
+        if content_type not in {"image/jpeg", "image/png", "image/webp", "image/gif"}:
+            raise AppError("只支持 JPG、PNG、WEBP 和 GIF")
+        try:
+            raw = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise AppError(f"{field_name}格式不正确") from exc
+        if not raw or len(raw) > max_bytes:
+            raise AppError(f"{field_name}太大，请换一张小一些的")
+        return content_type, raw
+
+    @staticmethod
+    def _images_for(
+        db: sqlite3.Connection, owner_type: str, owner_key: str
+    ) -> list[dict]:
+        return [
+            {"id": int(row["id"]), "width": row["width"], "height": row["height"]}
+            for row in db.execute(
+                """
+                SELECT id, width, height FROM note_images
+                WHERE owner_type = ? AND owner_key = ?
+                ORDER BY id
+                """,
+                (owner_type, owner_key),
+            )
+        ]
+
+    @staticmethod
+    def _attach_images(db, items: list[dict], owner_type: str, key_of) -> None:
+        for item in items:
+            item["images"] = []
+        if not items:
+            return
+        keys = [str(key_of(item)) for item in items]
+        placeholders = ",".join("?" for _ in keys)
+        grouped: dict[str, list[dict]] = {}
+        for row in db.execute(
+            f"""
+            SELECT id, owner_key, width, height FROM note_images
+            WHERE owner_type = ? AND owner_key IN ({placeholders})
+            ORDER BY id
+            """,
+            [owner_type, *keys],
+        ):
+            grouped.setdefault(row["owner_key"], []).append(
+                {
+                    "id": int(row["id"]),
+                    "width": row["width"],
+                    "height": row["height"],
+                }
+            )
+        for item, key in zip(items, keys):
+            item["images"] = grouped.get(key, [])
 
     def save_day(self, payload: dict) -> dict:
         plan_date = valid_date(payload.get("date"))
@@ -2229,12 +2534,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 HTTPStatus.INTERNAL_SERVER_ERROR,
             )
 
-    def _body(self) -> dict:
+    def _body(self, max_length: int = 1_000_000) -> dict:
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError as exc:
             raise AppError("请求内容不正确") from exc
-        if length > 1_000_000:
+        if length > max_length:
             raise AppError("内容过长")
         raw = self.rfile.read(length) if length else b"{}"
         try:
@@ -2276,6 +2581,34 @@ class RequestHandler(BaseHTTPRequestHandler):
         if method == "POST" and path == "/api/memos":
             self._json(self.database.create_memo(self._body()), HTTPStatus.CREATED)
             return
+        if method == "GET" and path == "/api/tags/suggested":
+            self._json({"tags": self.database.suggested_tags()})
+            return
+        if method == "POST" and path == "/api/images":
+            self._json(
+                self.database.create_note_image(self._body(14_000_000)),
+                HTTPStatus.CREATED,
+            )
+            return
+        image_prefix = "/api/images/"
+        if path.startswith(image_prefix):
+            suffix = path[len(image_prefix) :].strip("/")
+            parts = suffix.split("/")
+            if parts and parts[0].isdigit() and len(parts) <= 2:
+                image_id = int(parts[0])
+                thumbnail = len(parts) == 2 and parts[1] == "thumb"
+                if len(parts) == 2 and not thumbnail:
+                    raise AppError("没有找到这张图片", HTTPStatus.NOT_FOUND)
+                if method == "GET":
+                    content, content_type = self.database.read_note_image(
+                        image_id, thumbnail
+                    )
+                    self._bytes(content, content_type)
+                    return
+                if method == "DELETE" and not thumbnail:
+                    self.database.delete_note_image(image_id)
+                    self._json({"deleted": True})
+                    return
         if method == "POST" and path == "/api/timer/start":
             payload = self._body()
             self._json(
@@ -2424,6 +2757,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def _bytes(self, content: bytes, content_type: str) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "private, no-cache")
+        self.end_headers()
+        self.wfile.write(content)
 
 
 class DailyPlanServer(ThreadingHTTPServer):

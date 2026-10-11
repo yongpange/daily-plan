@@ -22,6 +22,13 @@ const state = {
   report: null,
   memos: [],
   todayMemos: [],
+  pendingQuickImages: [],
+  pendingComposeImages: [],
+  quickMemoDraftId: null,
+  composeMemoDraftId: null,
+  suggestedTags: [],
+  viewerImages: [],
+  viewerIndex: 0,
   activeTimer: null,
   syncedAt: Date.now(),
   parentEntry: null,
@@ -153,6 +160,45 @@ function formatMemoDate(value) {
   }).format(parseLocalDate(value));
 }
 
+function renderNote(value) {
+  const text = String(value || "");
+  if (!text.trim()) return "";
+  const pattern = /https?:\/\/[^\s<>"']+/gi;
+  let html = "";
+  let lastIndex = 0;
+  for (const match of text.matchAll(pattern)) {
+    const rawUrl = match[0].replace(/[),.;，。；、]+$/u, "");
+    html += escapeHtml(text.slice(lastIndex, match.index)).replaceAll("\n", "<br>");
+    const href = escapeHtml(rawUrl);
+    html += `<span class="note-link">
+      <a href="${href}" target="_blank" rel="noopener noreferrer">${href}</a>
+      <button type="button" class="copy-link" data-action="copy-link" data-url="${href}">复制</button>
+    </span>`;
+    lastIndex = match.index + rawUrl.length;
+  }
+  html += escapeHtml(text.slice(lastIndex)).replaceAll("\n", "<br>");
+  return html;
+}
+
+async function copyLink(url, button) {
+  try {
+    await navigator.clipboard.writeText(url);
+  } catch {
+    const field = document.createElement("textarea");
+    field.value = url;
+    document.body.append(field);
+    field.select();
+    document.execCommand("copy");
+    field.remove();
+  }
+  const original = button.textContent;
+  button.textContent = "已复制";
+  window.setTimeout(() => {
+    button.textContent = original;
+  }, 1200);
+  notify("链接已复制");
+}
+
 function splitTags(value) {
   return String(value || "")
     .split(/[,，\s]+/)
@@ -263,7 +309,7 @@ async function loadDay() {
   try {
     const [data, memos] = await Promise.all([
       api(`/api/day?date=${encodeURIComponent(state.date)}`),
-      api(`/api/memos?date=${encodeURIComponent(state.date)}&limit=5`),
+      api(`/api/memos?date=${encodeURIComponent(state.date)}&limit=30`),
     ]);
     if (sequence !== state.loadSequence || state.view !== "today") return;
     state.day = data;
@@ -305,6 +351,7 @@ function renderDay() {
   renderTodayRoutines();
   renderSummary();
   renderWorklog();
+  renderDayImages();
   renderTodayMemos();
   renderRunningBar();
 
@@ -397,7 +444,18 @@ function renderTasks() {
               <span class="${over ? "over-estimate" : ""}">
                 实际 <strong class="actual-time" data-entry-id="${entry.id}">${formatMinutes(actual / 60)}</strong>
               </span>
+              ${entry.definition?.trim() ? `<span class="note-hint">有说明</span>` : ""}
             </div>
+            ${
+              entry.definition?.trim()
+                ? `<div class="task-note">
+                    <div class="task-note-card">
+                      <p>完成标准 / 补充说明</p>
+                      <div class="task-note-body">${renderNote(entry.definition)}</div>
+                    </div>
+                  </div>`
+                : ""
+            }
           </div>
           <div class="task-actions">
             ${timerButtons}
@@ -511,6 +569,63 @@ function renderWorklog() {
     .join("");
 }
 
+function imageThumbUrl(id) {
+  return `/api/images/${id}/thumb`;
+}
+
+function imageOriginalUrl(id) {
+  return `/api/images/${id}`;
+}
+
+function imageThumbMarkup(image, removable = false) {
+  const remove = removable
+    ? `<button type="button" class="image-remove" data-action="delete-image" data-image-id="${image.id}" aria-label="移除图片">×</button>`
+    : "";
+  return `<span class="image-tile">
+    <button type="button" class="image-thumb" data-action="view-image" data-image-id="${image.id}" aria-label="查看原图">
+      <img src="${imageThumbUrl(image.id)}" alt="图片缩略图" />
+    </button>
+    ${remove}
+  </span>`;
+}
+
+function pendingThumbMarkup(item, bucket) {
+  return `<span class="image-tile">
+    <button type="button" class="image-thumb" data-action="view-pending" data-bucket="${bucket}" data-local-id="${item.localId}" aria-label="查看原图">
+      <img src="${item.preview}" alt="待上传图片" />
+    </button>
+    <button type="button" class="image-remove" data-action="remove-pending" data-bucket="${bucket}" data-local-id="${item.localId}" aria-label="移除图片">×</button>
+  </span>`;
+}
+
+function renderImageStrip(container, images, pending = [], bucket = "") {
+  if (!container) return;
+  container.innerHTML =
+    (images || []).map((image) => imageThumbMarkup(image, true)).join("") +
+    pending.map((item) => pendingThumbMarkup(item, bucket)).join("");
+}
+
+function syncImageAdder(input, count) {
+  const label = input?.closest(".image-add");
+  if (label) label.hidden = count >= 9;
+}
+
+function setStripBusy(strip, busy) {
+  if (!strip) return;
+  strip.querySelector("[data-image-busy]")?.remove();
+  if (!busy) return;
+  strip.insertAdjacentHTML(
+    "beforeend",
+    `<span class="image-tile is-uploading" data-image-busy="1" aria-label="正在处理图片"></span>`,
+  );
+}
+
+function renderDayImages() {
+  const images = state.day?.day?.images || [];
+  renderImageStrip($("#dayImageStrip"), images);
+  syncImageAdder($("#dayImageInput"), images.length);
+}
+
 function renderTodayMemos() {
   const container = $("#todayMemoList");
   if (!state.todayMemos.length) {
@@ -518,12 +633,382 @@ function renderTodayMemos() {
     return;
   }
   container.innerHTML = state.todayMemos
-    .slice(0, 3)
-    .map(
-      (memo) =>
-        `<div class="today-memo-item">${escapeHtml(memo.content)}</div>`,
-    )
+    .map((memo) => {
+      const thumbs = (memo.images || [])
+        .map((image) => imageThumbMarkup(image, false))
+        .join("");
+      return `<div class="today-memo-item">
+        ${memo.content ? `<p>${escapeHtml(memo.content)}</p>` : ""}
+        ${thumbs ? `<div class="image-strip">${thumbs}</div>` : ""}
+      </div>`;
+    })
     .join("");
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error("这张图片无法读取"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function canvasDataUrl(source, maxEdge, quality) {
+  const scale = Math.min(1, maxEdge / Math.max(source.width, source.height));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(source.width * scale));
+  canvas.height = Math.max(1, Math.round(source.height * scale));
+  const context = canvas.getContext("2d");
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(source, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/jpeg", quality);
+}
+
+async function prepareImage(file) {
+  if (!file.type.startsWith("image/")) {
+    throw new Error("请选择图片文件");
+  }
+  if (file.size > 12_000_000) {
+    throw new Error("单张图片请小于 12 MB");
+  }
+  const bitmap = await createImageBitmap(file);
+  const width = bitmap.width;
+  const height = bitmap.height;
+  const thumbnail = canvasDataUrl(bitmap, 360, 0.82);
+  const original =
+    file.size > 8_000_000
+      ? canvasDataUrl(bitmap, 2560, 0.9)
+      : await readFileAsDataUrl(file);
+  bitmap.close?.();
+  return { original, thumbnail, width, height };
+}
+
+async function uploadNoteImage(ownerType, ownerKey, prepared) {
+  return api("/api/images", {
+    method: "POST",
+    body: JSON.stringify({
+      owner_type: ownerType,
+      owner_key: ownerKey,
+      original: prepared.original,
+      thumbnail: prepared.thumbnail,
+      width: prepared.width,
+      height: prepared.height,
+    }),
+  });
+}
+
+function renderPendingImages() {
+  renderImageStrip(
+    $("#quickImageStrip"),
+    [],
+    state.pendingQuickImages,
+    "quick",
+  );
+  renderImageStrip(
+    $("#composeImageStrip"),
+    [],
+    state.pendingComposeImages,
+    "compose",
+  );
+  syncImageAdder(
+    $("#quickImageInput"),
+    state.pendingQuickImages.length,
+  );
+  syncImageAdder(
+    $("#composeImageInput"),
+    state.pendingComposeImages.length,
+  );
+}
+
+function renderMemoEditImages() {
+  const images = state.editingMemo?.images || [];
+  renderImageStrip($("#memoEditImageStrip"), images);
+  syncImageAdder($("#memoEditImageInput"), images.length);
+}
+
+async function addFilesToBucket(files, bucket) {
+  const list =
+    bucket === "quick" ? state.pendingQuickImages : state.pendingComposeImages;
+  const strip = bucket === "quick" ? $("#quickImageStrip") : $("#composeImageStrip");
+  for (const file of files) {
+    if (list.length >= 9) {
+      notify("一条记录最多 9 张图片", true);
+      break;
+    }
+    setStripBusy(strip, true);
+    try {
+      const prepared = await prepareImage(file);
+      list.push({
+        localId: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        preview: prepared.thumbnail,
+        prepared,
+      });
+    } finally {
+      renderPendingImages();
+    }
+  }
+}
+
+async function addDayImages(files) {
+  if (!state.day?.day) {
+    notify("页面还在加载，请稍后再添加图片", true);
+    return;
+  }
+  const current = state.day.day.images || (state.day.day.images = []);
+  for (const file of files) {
+    if (current.length >= 9) {
+      notify("一条记录最多 9 张图片", true);
+      break;
+    }
+    setStripBusy($("#dayImageStrip"), true);
+    try {
+      current.push(
+        await uploadNoteImage("day", state.date, await prepareImage(file)),
+      );
+    } finally {
+      renderDayImages();
+    }
+  }
+}
+
+async function addMemoEditImages(files) {
+  if (!state.editingMemo) return;
+  const current = state.editingMemo.images || (state.editingMemo.images = []);
+  for (const file of files) {
+    if (current.length >= 9) {
+      notify("一条记录最多 9 张图片", true);
+      break;
+    }
+    setStripBusy($("#memoEditImageStrip"), true);
+    try {
+      current.push(
+        await uploadNoteImage(
+          "memo",
+          state.editingMemo.id,
+          await prepareImage(file),
+        ),
+      );
+    } finally {
+      renderMemoEditImages();
+    }
+  }
+}
+
+async function deleteSavedImage(imageId) {
+  await api(`/api/images/${imageId}`, { method: "DELETE" });
+  if (state.day?.day?.images) {
+    state.day.day.images = state.day.day.images.filter((image) => image.id !== imageId);
+    renderDayImages();
+  }
+  if (state.editingMemo?.images) {
+    state.editingMemo.images = state.editingMemo.images.filter(
+      (image) => image.id !== imageId,
+    );
+    renderMemoEditImages();
+  }
+  state.todayMemos.forEach((memo) => {
+    memo.images = (memo.images || []).filter((image) => image.id !== imageId);
+  });
+  state.memos.forEach((memo) => {
+    memo.images = (memo.images || []).filter((image) => image.id !== imageId);
+  });
+  renderTodayMemos();
+  if (state.view === "memos") renderMemos($("#memoSearchInput")?.value.trim() || "");
+  notify("图片已移除");
+}
+
+async function uploadPendingImages(bucket, ownerKey) {
+  const key = bucket === "quick" ? "pendingQuickImages" : "pendingComposeImages";
+  const queue = [...state[key]];
+  state[key] = [];
+  renderPendingImages();
+  for (let index = 0; index < queue.length; index += 1) {
+    try {
+      await uploadNoteImage("memo", ownerKey, queue[index].prepared);
+    } catch (error) {
+      state[key] = queue.slice(index);
+      renderPendingImages();
+      throw error;
+    }
+  }
+}
+
+function bindImageInput(input, handler) {
+  input.addEventListener("change", async (event) => {
+    const files = [...event.target.files];
+    event.target.value = "";
+    if (!files.length) return;
+    try {
+      await handler(files);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+}
+
+function transferHasFile(dataTransfer) {
+  if (!dataTransfer) return false;
+  if ([...dataTransfer.types].includes("Files")) return true;
+  return [...dataTransfer.items].some(
+    (item) => item.kind === "file" || item.type.startsWith("image/"),
+  );
+}
+
+function bindImageDrop(target, handler) {
+  target.addEventListener("dragenter", (event) => {
+    if (!transferHasFile(event.dataTransfer)) return;
+    event.preventDefault();
+    target.classList.add("is-dropping");
+  });
+  target.addEventListener("dragover", (event) => {
+    if (!transferHasFile(event.dataTransfer)) return;
+    event.preventDefault();
+    target.classList.add("is-dropping");
+  });
+  target.addEventListener("dragleave", (event) => {
+    if (event.relatedTarget && target.contains(event.relatedTarget)) return;
+    target.classList.remove("is-dropping");
+  });
+  target.addEventListener("drop", async (event) => {
+    if (!transferHasFile(event.dataTransfer)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    target.classList.remove("is-dropping");
+    const files = [...event.dataTransfer.files].filter((file) =>
+      file.type.startsWith("image/"),
+    );
+    if (!files.length) {
+      notify("请拖入图片文件", true);
+      return;
+    }
+    try {
+      await handler(files);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+}
+
+function bindImagePaste(target, handler) {
+  target.addEventListener("paste", async (event) => {
+    const files = [...event.clipboardData.items]
+      .filter((item) => item.type.startsWith("image/"))
+      .map((item) => item.getAsFile())
+      .filter(Boolean);
+    if (!files.length) return;
+    event.preventDefault();
+    try {
+      await handler(files);
+    } catch (error) {
+      reportError(error);
+    }
+  });
+}
+
+function fitViewerImage(picture = $("#imageViewerPicture")) {
+  if (!picture?.naturalWidth || !picture.naturalHeight) return;
+  const maxWidth = Math.max(160, window.innerWidth - 144);
+  const maxHeight = Math.max(160, window.innerHeight - 120);
+  const scale = Math.min(
+    maxWidth / picture.naturalWidth,
+    maxHeight / picture.naturalHeight,
+  );
+  picture.style.width = `${Math.round(picture.naturalWidth * scale)}px`;
+  picture.style.height = `${Math.round(picture.naturalHeight * scale)}px`;
+}
+
+function openImageViewer(images, index) {
+  if (!images.length || index < 0) return;
+  state.viewerImages = images;
+  state.viewerIndex = index;
+  const current = images[index];
+  const picture = $("#imageViewerPicture");
+  picture.alt = "原图";
+  picture.style.width = "";
+  picture.style.height = "";
+  picture.src = current.preview || imageOriginalUrl(current.id);
+  if (picture.complete) fitViewerImage(picture);
+  const multiple = images.length > 1;
+  $("#previousImage").hidden = !multiple;
+  $("#nextImage").hidden = !multiple;
+  const caption = $("#imageViewerCaption");
+  caption.hidden = !multiple;
+  caption.textContent = multiple ? `${index + 1} / ${images.length}` : "";
+  if (!$("#imageViewer").open) $("#imageViewer").showModal();
+}
+
+function stepImageViewer(direction) {
+  if (state.viewerImages.length < 2) return;
+  state.viewerIndex =
+    (state.viewerIndex + direction + state.viewerImages.length) %
+    state.viewerImages.length;
+  openImageViewer(state.viewerImages, state.viewerIndex);
+}
+
+function renderTagPresets() {
+  $$(".tag-presets").forEach((box) => {
+    const input = document.getElementById(box.dataset.tagInput);
+    const current = new Set(splitTags(input?.value));
+    box.hidden = state.suggestedTags.length === 0;
+    box.innerHTML = state.suggestedTags.length
+      ? `<span class="tag-presets-label">最近常用</span>${state.suggestedTags
+          .map(
+            (tag) =>
+              `<button type="button" class="tag-preset ${current.has(tag) ? "is-active" : ""}" data-tag="${escapeHtml(tag)}">${escapeHtml(tag)}</button>`,
+          )
+          .join("")}`
+      : "";
+  });
+}
+
+async function loadSuggestedTags() {
+  try {
+    const data = await api("/api/tags/suggested");
+    state.suggestedTags = data.tags || [];
+    renderTagPresets();
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+function applyTagPreset(input, tag) {
+  const tags = splitTags(input.value);
+  const existing = tags.indexOf(tag);
+  if (existing >= 0) tags.splice(existing, 1);
+  else tags.push(tag);
+  input.value = tags.join(", ");
+  input.dispatchEvent(new Event("input"));
+  input.focus();
+}
+
+function syncStickyOffset() {
+  const header = $(".app-header");
+  if (!header) return;
+  const headerHeight = Math.round(header.getBoundingClientRect().height);
+  document.documentElement.style.setProperty(
+    "--header-height",
+    `${headerHeight}px`,
+  );
+  const running = $("#runningBar");
+  const breakBar = $("#breakBar");
+  const runningHeight =
+    running && !running.hidden
+      ? Math.round(running.getBoundingClientRect().height)
+      : 0;
+  const breakHeight =
+    breakBar && !breakBar.hidden
+      ? Math.round(breakBar.getBoundingClientRect().height)
+      : 0;
+  document.documentElement.style.setProperty(
+    "--running-height",
+    `${runningHeight}px`,
+  );
+  document.documentElement.style.setProperty(
+    "--bar-height",
+    `${runningHeight + breakHeight}px`,
+  );
 }
 
 function renderRunningBar() {
@@ -532,6 +1017,7 @@ function renderRunningBar() {
   bar.hidden = !active;
   if (!active) {
     safeStorageRemove(STORAGE.timer);
+    syncStickyOffset();
     return;
   }
   const elapsed = Math.max(
@@ -560,6 +1046,7 @@ function renderRunningBar() {
       targetSeconds: active.target_seconds,
     }),
   );
+  syncStickyOffset();
 }
 
 function updateLiveTimers() {
@@ -785,6 +1272,7 @@ function renderBreakBar() {
   const remaining = state.breakUntil - Date.now();
   $("#breakBar").hidden = remaining <= 0;
   if (remaining > 0) $("#breakTime").textContent = formatClock(remaining / 1000);
+  syncStickyOffset();
 }
 
 function updateBreakTimer() {
@@ -1145,15 +1633,15 @@ async function submitCloseDay(event) {
 async function createMemo(payload, button) {
   setBusy(button, true, "保存中…");
   try {
-    await api("/api/memos", {
+    const memo = await api("/api/memos", {
       method: "POST",
       body: JSON.stringify(payload),
     });
-    notify("碎片感悟已保存");
-    return true;
+    notify("已经记下来");
+    return memo;
   } catch (error) {
     reportError(error);
-    return false;
+    return null;
   } finally {
     setBusy(button, false);
   }
@@ -1162,38 +1650,99 @@ async function createMemo(payload, button) {
 async function submitQuickMemo(event) {
   event.preventDefault();
   const form = event.currentTarget;
-  const success = await createMemo(
-    {
-      date: state.date,
-      content: $("#quickMemoContent").value,
-      tags: $("#quickMemoTags").value,
-    },
-    event.submitter,
-  );
-  if (success) {
-    form.reset();
-    state.todayMemos = await api(
-      `/api/memos?date=${encodeURIComponent(state.date)}&limit=5`,
-    );
-    renderTodayMemos();
+  const content = $("#quickMemoContent").value.trim();
+  const tags = $("#quickMemoTags").value;
+  if (!content && !state.pendingQuickImages.length && !state.quickMemoDraftId) {
+    notify("先写下一句，或添加一张图片", true);
+    return;
   }
+  let memoId = state.quickMemoDraftId;
+  const retrying = Boolean(memoId);
+  if (!memoId) {
+    const memo = await createMemo(
+      {
+        date: state.date,
+        content,
+        tags,
+        has_images: state.pendingQuickImages.length > 0,
+      },
+      event.submitter,
+    );
+    if (!memo) return;
+    memoId = memo.id;
+    state.quickMemoDraftId = memoId;
+  }
+  try {
+    await uploadPendingImages("quick", memoId);
+    if (retrying) {
+      await api(`/api/memos/${memoId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ date: state.date, content, tags }),
+      });
+    }
+  } catch (error) {
+    reportError(error);
+    notify("文字已经保存，剩下的图片可以再点一次记下来", true);
+    return;
+  }
+  state.quickMemoDraftId = null;
+  form.reset();
+  renderTagPresets();
+  state.todayMemos = await api(
+    `/api/memos?date=${encodeURIComponent(state.date)}&limit=30`,
+  );
+  renderTodayMemos();
+  await loadSuggestedTags();
 }
 
 async function submitMemoCompose(event) {
   event.preventDefault();
-  const success = await createMemo(
-    {
-      date: $("#memoDate").value,
-      content: $("#memoContent").value,
-      tags: $("#memoTags").value,
-    },
-    event.submitter,
-  );
-  if (success) {
-    $("#memoContent").value = "";
-    $("#memoTags").value = "";
-    await loadMemos();
+  const content = $("#memoContent").value.trim();
+  const tags = $("#memoTags").value;
+  if (!content && !state.pendingComposeImages.length && !state.composeMemoDraftId) {
+    notify("先写下一句，或添加一张图片", true);
+    return;
   }
+  let memoId = state.composeMemoDraftId;
+  const retrying = Boolean(memoId);
+  if (!memoId) {
+    const memo = await createMemo(
+      {
+        date: $("#memoDate").value,
+        content,
+        tags,
+        has_images: state.pendingComposeImages.length > 0,
+      },
+      event.submitter,
+    );
+    if (!memo) return;
+    memoId = memo.id;
+    state.composeMemoDraftId = memoId;
+  }
+  try {
+    await uploadPendingImages("compose", memoId);
+    if (retrying) {
+      await api(`/api/memos/${memoId}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          date: $("#memoDate").value,
+          content,
+          tags,
+        }),
+      });
+    }
+  } catch (error) {
+    reportError(error);
+    notify("文字已经保存，剩下的图片可以再点一次保存", true);
+    return;
+  }
+  state.composeMemoDraftId = null;
+  $("#memoContent").value = "";
+  $("#memoTags").value = "";
+  renderPendingImages();
+  renderTagPresets();
+  await loadMemos();
+  await loadSuggestedTags();
 }
 
 async function loadMemos() {
@@ -1211,7 +1760,7 @@ async function loadMemos() {
 function renderMemos(query = "") {
   $("#memoFilterSummary").textContent = query
     ? `“${query}”找到 ${state.memos.length} 条记录（包含每日感悟）`
-    : `共显示 ${state.memos.length} 条碎片感悟`;
+    : `共显示 ${state.memos.length} 条记录`;
   const feed = $("#memoFeed");
   if (!state.memos.length) {
     feed.innerHTML =
@@ -1235,7 +1784,12 @@ function renderMemos(query = "") {
               }
             </div>
           </div>
-          <p class="memo-content">${escapeHtml(memo.content)}</p>
+          ${memo.content ? `<p class="memo-content">${escapeHtml(memo.content)}</p>` : ""}
+          ${
+            (memo.images || []).length
+              ? `<div class="image-strip">${memo.images.map((image) => imageThumbMarkup(image, false)).join("")}</div>`
+              : ""
+          }
           ${
             tags.length
               ? `<div class="memo-tags">${tags.map((tag) => `<span class="memo-tag">#${escapeHtml(tag)}</span>`).join("")}</div>`
@@ -1255,6 +1809,8 @@ function openMemoEdit(memoId) {
   $("#memoEditDate").value = memo.memo_date;
   $("#memoEditTags").value = memo.tags || "";
   $("#memoEditPinned").checked = Boolean(memo.pinned);
+  renderMemoEditImages();
+  renderTagPresets();
   $("#memoDialog").showModal();
 }
 
@@ -2049,6 +2605,12 @@ function bindEvents() {
   $("#taskList").addEventListener("click", (event) => {
     const button = event.target.closest("[data-action]");
     if (!button) return;
+    if (button.dataset.action === "copy-link") {
+      event.preventDefault();
+      event.stopPropagation();
+      copyLink(button.dataset.url, button);
+      return;
+    }
     const entryId = Number(button.dataset.entryId);
     const entry = state.day.entries.find((item) => item.id === entryId);
     if (button.dataset.action === "start") startTimer(entryId, button);
@@ -2113,6 +2675,113 @@ function bindEvents() {
   $("#closeDayForm").addEventListener("submit", submitCloseDay);
 
   $("#quickMemoForm").addEventListener("submit", submitQuickMemo);
+  $("#quickMemoTags").addEventListener("input", renderTagPresets);
+  $("#memoTags").addEventListener("input", renderTagPresets);
+  $("#memoEditTags").addEventListener("input", renderTagPresets);
+  document.addEventListener("click", (event) => {
+    const preset = event.target.closest(".tag-preset");
+    if (!preset) return;
+    const input = document.getElementById(
+      preset.closest(".tag-presets").dataset.tagInput,
+    );
+    if (input) applyTagPreset(input, preset.dataset.tag);
+  });
+  bindImageInput($("#dayImageInput"), (files) => addDayImages(files));
+  bindImageInput($("#quickImageInput"), (files) => addFilesToBucket(files, "quick"));
+  bindImageInput($("#composeImageInput"), (files) =>
+    addFilesToBucket(files, "compose"),
+  );
+  bindImageInput($("#memoEditImageInput"), (files) => addMemoEditImages(files));
+  bindImageDrop($(".reflection-panel"), (files) => addDayImages(files));
+  bindImageDrop($(".quick-memo-panel"), (files) => addFilesToBucket(files, "quick"));
+  bindImageDrop($(".memo-compose-panel"), (files) =>
+    addFilesToBucket(files, "compose"),
+  );
+  bindImageDrop($("#memoDialog"), (files) => addMemoEditImages(files));
+  bindImagePaste($("#reflectionInput"), (files) => addDayImages(files));
+  bindImagePaste($("#quickMemoContent"), (files) => addFilesToBucket(files, "quick"));
+  bindImagePaste($("#memoContent"), (files) => addFilesToBucket(files, "compose"));
+  bindImagePaste($("#memoEditContent"), (files) => addMemoEditImages(files));
+  document.addEventListener("click", async (event) => {
+    const view = event.target.closest("[data-action='view-image']");
+    if (view) {
+      const strip = view.closest(".image-strip");
+      const images = [...strip.querySelectorAll("[data-image-id]")].map((item) => ({
+        id: Number(item.dataset.imageId),
+      }));
+      const unique = [];
+      const seen = new Set();
+      images.forEach((image) => {
+        if (!seen.has(image.id)) {
+          seen.add(image.id);
+          unique.push(image);
+        }
+      });
+      openImageViewer(
+        unique,
+        unique.findIndex((image) => image.id === Number(view.dataset.imageId)),
+      );
+      return;
+    }
+    const pendingView = event.target.closest("[data-action='view-pending']");
+    if (pendingView) {
+      const list =
+        pendingView.dataset.bucket === "quick"
+          ? state.pendingQuickImages
+          : state.pendingComposeImages;
+      openImageViewer(
+        list.map((item) => ({ preview: item.prepared.original })),
+        list.findIndex((item) => item.localId === pendingView.dataset.localId),
+      );
+      return;
+    }
+    const removePending = event.target.closest("[data-action='remove-pending']");
+    if (removePending) {
+      const key =
+        removePending.dataset.bucket === "quick"
+          ? "pendingQuickImages"
+          : "pendingComposeImages";
+      state[key] = state[key].filter(
+        (item) => item.localId !== removePending.dataset.localId,
+      );
+      renderPendingImages();
+      return;
+    }
+    const removeSaved = event.target.closest("[data-action='delete-image']");
+    if (removeSaved) {
+      event.preventDefault();
+      event.stopPropagation();
+      try {
+        await deleteSavedImage(Number(removeSaved.dataset.imageId));
+      } catch (error) {
+        reportError(error);
+      }
+    }
+  });
+  $("#imageViewerPicture").addEventListener("load", () => fitViewerImage());
+  $("#imageViewerPicture").addEventListener("error", () => {
+    $("#imageViewerPicture").alt = "原图没有加载出来";
+  });
+  window.addEventListener("resize", () => {
+    if ($("#imageViewer").open) fitViewerImage();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (!$("#imageViewer").open) return;
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      stepImageViewer(-1);
+    }
+    if (event.key === "ArrowRight") {
+      event.preventDefault();
+      stepImageViewer(1);
+    }
+  });
+  $("#closeImageViewer").addEventListener("click", () => $("#imageViewer").close());
+  $("#imageViewer").addEventListener("click", (event) => {
+    if (event.target === $("#imageViewer")) $("#imageViewer").close();
+  });
+  $("#previousImage").addEventListener("click", () => stepImageViewer(-1));
+  $("#nextImage").addEventListener("click", () => stepImageViewer(1));
   $("#memoComposeForm").addEventListener("submit", submitMemoCompose);
   $("#memoSearchInput").addEventListener("input", () => {
     window.clearTimeout(state.memoSearchTimer);
@@ -2190,7 +2859,10 @@ function initialize() {
   $("#memoDate").value = localDateString(new Date());
   renderBreakBar();
   loadSettings();
+  loadSuggestedTags();
   switchView(state.view);
+  syncStickyOffset();
+  window.addEventListener("resize", syncStickyOffset);
   window.setInterval(updateLiveTimers, 1000);
 }
 
