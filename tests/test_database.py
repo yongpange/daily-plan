@@ -544,6 +544,14 @@ class DatabaseTests(unittest.TestCase):
         with self.assertRaises(AppError):
             self.database.delete_reminder(created["id"])
 
+    def test_completed_task_remains_on_that_day(self):
+        entry = self.add_entry("写完复盘明细", estimate=40)
+        updated = self.database.update_entry(entry["id"], {"outcome": "completed"})
+        day = self.database.get_day(self.today)
+        self.assertEqual(updated["outcome"], "completed")
+        self.assertEqual(day["entries"][0]["title"], "写完复盘明细")
+        self.assertEqual(day["entries"][0]["outcome"], "completed")
+
 
 if __name__ == "__main__":
     unittest.main()

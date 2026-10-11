@@ -26,6 +26,9 @@ const state = {
   pendingComposeImages: [],
   quickMemoDraftId: null,
   composeMemoDraftId: null,
+  dayDetailDate: "",
+  dayDetail: null,
+  dayDetailSequence: 0,
   reminders: [],
   editingReminderId: null,
   alertedReminderIds: new Set(),
@@ -346,7 +349,9 @@ function renderDay() {
         : state.date === shiftDate(today, 1)
           ? "明天"
           : `${current.getFullYear()} 年`;
-  $("#backToday").hidden = state.date === today;
+  const backToday = $("#backToday");
+  backToday.hidden = false;
+  backToday.disabled = state.date === today;
   $("#focusInput").value = state.day.day.focus || "";
   updateMoodButtons();
   renderProjectOptions();
@@ -1780,8 +1785,10 @@ function renderMemos(query = "") {
             <div class="memo-card-actions">
               ${
                 daily
-                  ? `<button data-memo-action="open-day" data-date="${memo.memo_date}">打开当天</button>`
-                  : `<button data-memo-action="pin" data-memo-id="${memo.id}">${memo.pinned ? "取消置顶" : "置顶"}</button>
+                  ? `<button data-memo-action="promote" data-memo-id="${escapeHtml(memo.id)}">加入今天</button>
+                     <button data-memo-action="open-day" data-date="${memo.memo_date}">打开当天</button>`
+                  : `<button data-memo-action="promote" data-memo-id="${escapeHtml(memo.id)}">加入今天</button>
+                     <button data-memo-action="pin" data-memo-id="${memo.id}">${memo.pinned ? "取消置顶" : "置顶"}</button>
                      <button data-memo-action="edit" data-memo-id="${memo.id}">编辑</button>`
               }
             </div>
@@ -1838,6 +1845,48 @@ async function saveMemoEdit(event) {
     $("#memoDialog").close();
     await loadMemos();
     notify("感悟已更新");
+  } catch (error) {
+    reportError(error);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+function taskDraftFromNote(content) {
+  const text = String(content || "").replace(/\s+/g, " ").trim();
+  if (!text) return null;
+  const title = text.length > 80 ? `${text.slice(0, 80).trim()}…` : text;
+  const definition = text.length > 80 ? text.slice(0, 1000) : "";
+  return { title: title.slice(0, 240), definition };
+}
+
+async function promoteMemo(memoId, button) {
+  const memo = state.memos.find((item) => String(item.id) === String(memoId));
+  const draft = taskDraftFromNote(memo?.content);
+  if (!draft) {
+    notify("先写下一句，再加入今天的清单", true);
+    return;
+  }
+  const today = localDateString(new Date());
+  setBusy(button, true, "加入中…");
+  try {
+    const day = await api(`/api/day?date=${encodeURIComponent(today)}`);
+    const exists = (day.entries || []).some((entry) => entry.title === draft.title);
+    if (exists) {
+      notify("今天的清单里已经有这条任务");
+      return;
+    }
+    await api("/api/entries", {
+      method: "POST",
+      body: JSON.stringify({
+        date: today,
+        title: draft.title,
+        definition: draft.definition,
+        estimate_minutes: 30,
+      }),
+    });
+    if (state.view === "today" && state.date === today) await loadDay();
+    notify("已加入今天的清单，原记录仍留在感悟库");
   } catch (error) {
     reportError(error);
   } finally {
@@ -1967,6 +2016,8 @@ function renderReport() {
   renderRoutineBoard();
   $("#weekReviewInput").value = state.report.review || "";
   $("#weekReviewStatus").textContent = "";
+  ensureDayDetailDate();
+  loadDayDetail();
 }
 
 function reportChartGroups() {
@@ -2005,6 +2056,81 @@ function reportChartGroups() {
   return groups;
 }
 
+function ensureDayDetailDate() {
+  if (!state.dayDetailDate) {
+    state.dayDetailDate = shiftDate(localDateString(new Date()), -1);
+  }
+}
+
+function dayDetailHeading(date) {
+  const today = localDateString(new Date());
+  const parsed = parseLocalDate(date);
+  const label = new Intl.DateTimeFormat("zh-CN", {
+    month: "long",
+    day: "numeric",
+    weekday: "long",
+  }).format(parsed);
+  if (date === today) return `今天 · ${label}`;
+  if (date === shiftDate(today, -1)) return `昨天 · ${label}`;
+  if (date === shiftDate(today, -2)) return `前天 · ${label}`;
+  return label;
+}
+
+async function loadDayDetail() {
+  ensureDayDetailDate();
+  const date = state.dayDetailDate;
+  const input = $("#dayDetailDate");
+  if (input) input.value = date;
+  const sequence = ++state.dayDetailSequence;
+  try {
+    const data = await api(`/api/day?date=${encodeURIComponent(date)}`);
+    if (sequence !== state.dayDetailSequence || state.dayDetailDate !== date) return;
+    state.dayDetail = data;
+    renderDayDetail();
+    $$("[data-chart-date]").forEach((column) => {
+      column.classList.toggle("is-selected", column.dataset.chartDate === date);
+    });
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+function renderDayDetail() {
+  const date = state.dayDetailDate;
+  const heading = $("#dayDetailTitle");
+  const summary = $("#dayDetailSummary");
+  const list = $("#dayDetailList");
+  if (!heading || !list) return;
+  heading.textContent = dayDetailHeading(date);
+  const entries = (state.dayDetail?.entries || []).filter(
+    (entry) => entry.outcome === "completed" && !entry.has_children,
+  );
+  if (!entries.length) {
+    summary.textContent = "这一天没有标记完成的任务";
+    list.innerHTML = "";
+    return;
+  }
+  const actualMinutes = entries.reduce(
+    (sum, entry) => sum + Number(entry.actual_seconds || 0) / 60,
+    0,
+  );
+  summary.textContent = `完成 ${entries.length} 项 · 实际 ${formatMinutes(actualMinutes)}`;
+  list.innerHTML = entries
+    .map((entry) => {
+      const note = String(entry.definition || "").trim();
+      const showNote = note && note !== entry.title;
+      return `
+        <article class="day-detail-item">
+          <div>
+            <strong>${escapeHtml(entry.title)}</strong>
+            <span>${escapeHtml(entry.project_name || "未分类")} · 预估 ${formatMinutes(entry.estimate_minutes)} · 实际 ${formatMinutes(Number(entry.actual_seconds || 0) / 60)}</span>
+            ${showNote ? `<p>${escapeHtml(note)}</p>` : ""}
+          </div>
+        </article>`;
+    })
+    .join("");
+}
+
 function renderReportChart() {
   const groups = reportChartGroups();
   const maximum = Math.max(
@@ -2023,7 +2149,7 @@ function renderReportChart() {
       const actual = item.actual_seconds / 60;
       const dateValue = parseLocalDate(item.date);
       return `
-        <div class="day-column">
+        <div class="day-column ${item.date === state.dayDetailDate ? "is-selected" : ""}" data-chart-date="${escapeHtml(item.date)}">
           <div class="bar-space" title="计划 ${formatMinutes(planned)}；实际 ${formatMinutes(actual)}">
             <i class="chart-bar planned" style="height:${(planned / maximum) * 170}px"></i>
             <i class="chart-bar actual" style="height:${(actual / maximum) * 170}px"></i>
@@ -3022,6 +3148,9 @@ function bindEvents() {
   $("#memoFeed").addEventListener("click", (event) => {
     const button = event.target.closest("[data-memo-action]");
     if (!button) return;
+    if (button.dataset.memoAction === "promote") {
+      promoteMemo(button.dataset.memoId, button);
+    }
     if (button.dataset.memoAction === "edit") {
       openMemoEdit(Number(button.dataset.memoId));
     }
@@ -3036,6 +3165,32 @@ function bindEvents() {
   $("#memoEditForm").addEventListener("submit", saveMemoEdit);
   $("#deleteMemo").addEventListener("click", deleteMemo);
   $("#saveWeekReview").addEventListener("click", saveReportReview);
+  $("#weekChart").addEventListener("click", (event) => {
+    const column = event.target.closest("[data-chart-date]");
+    if (!column) return;
+    state.dayDetailDate = column.dataset.chartDate;
+    loadDayDetail();
+    $("#dayDetailPanel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  });
+  $("#dayDetailDate").addEventListener("change", (event) => {
+    if (!event.target.value) return;
+    state.dayDetailDate = event.target.value;
+    loadDayDetail();
+  });
+  $("#dayDetailPrevious").addEventListener("click", () => {
+    ensureDayDetailDate();
+    state.dayDetailDate = shiftDate(state.dayDetailDate, -1);
+    loadDayDetail();
+  });
+  $("#dayDetailNext").addEventListener("click", () => {
+    ensureDayDetailDate();
+    state.dayDetailDate = shiftDate(state.dayDetailDate, 1);
+    loadDayDetail();
+  });
+  $("#dayDetailYesterday").addEventListener("click", () => {
+    state.dayDetailDate = shiftDate(localDateString(new Date()), -1);
+    loadDayDetail();
+  });
 
   $("#routineTodayList").addEventListener("click", (event) => {
     const button = event.target.closest("[data-action]");

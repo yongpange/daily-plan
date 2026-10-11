@@ -342,6 +342,23 @@
             <div id="weekChart" class="week-chart"></div>
           </section>
 
+          <section id="dayDetailPanel" class="panel day-detail-panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">回头看一天</p>
+                <h2 id="dayDetailTitle">这一天完成了什么</h2>
+              </div>
+              <div class="day-detail-controls">
+                <button id="dayDetailPrevious" class="icon-button" type="button" aria-label="前一天">←</button>
+                <input id="dayDetailDate" type="date" aria-label="查看哪一天" />
+                <button id="dayDetailNext" class="icon-button" type="button" aria-label="后一天">→</button>
+                <button id="dayDetailYesterday" class="button subtle compact" type="button">昨天</button>
+              </div>
+            </div>
+            <p id="dayDetailSummary" class="day-detail-summary"></p>
+            <div id="dayDetailList" class="day-detail-list"></div>
+          </section>
+
           <section class="panel routine-report-panel">
             <div class="panel-header">
               <div>

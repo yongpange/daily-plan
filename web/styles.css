@@ -434,6 +434,17 @@ h3 {
   border-color: #bdc9c3;
 }
 
+#backToday:disabled,
+#backToday:disabled:hover,
+#backToday:disabled:active {
+  color: #9aa39e;
+  background: #f3f5f4;
+  border-color: var(--line);
+  opacity: 1;
+  transform: none;
+  cursor: not-allowed;
+}
+
 .button.danger {
   border-color: rgba(255, 255, 255, 0.28);
   color: #fff;
@@ -1047,8 +1058,66 @@ h3 {
   gap: 18px;
 }
 
-.week-chart-panel {
+.week-chart-panel,
+.day-detail-panel {
   grid-column: 1 / -1;
+}
+
+.day-column {
+  cursor: pointer;
+}
+
+.day-column.is-selected .day-label strong {
+  color: var(--green-dark);
+}
+
+.day-detail-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.day-detail-controls input {
+  height: 34px;
+}
+
+.day-detail-summary {
+  margin: 0 20px 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.day-detail-list {
+  display: grid;
+  gap: 8px;
+  padding: 0 20px 18px;
+}
+
+.day-detail-item {
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #fff;
+}
+
+.day-detail-item strong {
+  display: block;
+  font-size: 15px;
+}
+
+.day-detail-item span {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.day-detail-item p {
+  margin: 8px 0 0;
+  color: #3d4843;
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .chart-legend {
