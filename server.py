@@ -318,6 +318,7 @@ class Database:
                 "INTEGER NOT NULL DEFAULT 0",
             )
             self._ensure_image_ids(db)
+            self._merge_daily_notes(db)
 
     @staticmethod
     def _ensure_image_ids(db: sqlite3.Connection) -> None:
@@ -356,6 +357,87 @@ class Database:
             CREATE INDEX IF NOT EXISTS note_images_by_owner
             ON note_images(owner_type, owner_key, id)
             """
+        )
+
+    @staticmethod
+    def _merge_daily_notes(db: sqlite3.Connection) -> None:
+        marker = db.execute(
+            "SELECT 1 FROM app_settings WHERE key = 'daily_notes_merged'"
+        ).fetchone()
+        if marker:
+            return
+        now = utc_now()
+        dates = [
+            row["plan_date"]
+            for row in db.execute(
+                """
+                SELECT plan_date FROM days WHERE TRIM(reflection) <> ''
+                UNION
+                SELECT owner_key AS plan_date FROM note_images
+                WHERE owner_type = 'day'
+                """
+            )
+        ]
+        for plan_date in dates:
+            day = db.execute(
+                "SELECT reflection, updated_at FROM days WHERE plan_date = ?",
+                (plan_date,),
+            ).fetchone()
+            content = str(day["reflection"]).strip() if day else ""
+            has_images = db.execute(
+                """
+                SELECT EXISTS(
+                    SELECT 1 FROM note_images
+                    WHERE owner_type = 'day' AND owner_key = ?
+                )
+                """,
+                (plan_date,),
+            ).fetchone()[0]
+            if not content and not has_images:
+                continue
+            existing = None
+            if content:
+                existing = db.execute(
+                    """
+                    SELECT id FROM memos
+                    WHERE memo_date = ? AND content = ?
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (plan_date, content),
+                ).fetchone()
+            if existing:
+                memo_id = int(existing["id"])
+            else:
+                created_at = day["updated_at"] if day else now
+                cursor = db.execute(
+                    """
+                    INSERT INTO memos(
+                        memo_date, content, tags, pinned, created_at, updated_at
+                    ) VALUES (?, ?, '', 0, ?, ?)
+                    """,
+                    (plan_date, content, created_at, now),
+                )
+                memo_id = int(cursor.lastrowid)
+            db.execute(
+                """
+                UPDATE note_images
+                SET owner_type = 'memo', owner_key = ?
+                WHERE owner_type = 'day' AND owner_key = ?
+                """,
+                (str(memo_id), plan_date),
+            )
+            if content:
+                db.execute(
+                    "UPDATE days SET reflection = '' WHERE plan_date = ?",
+                    (plan_date,),
+                )
+        db.execute(
+            """
+            INSERT INTO app_settings(key, value, updated_at)
+            VALUES ('daily_notes_merged', '1', ?)
+            """,
+            (now,),
         )
 
     @staticmethod

@@ -455,5 +455,60 @@ class DatabaseTests(unittest.TestCase):
 
         self.assertEqual(self.database.suggested_tags(), ["估时", "复盘", "产品"])
 
+    def test_daily_reflection_merges_into_one_memo(self):
+        tiny_png = (
+            "data:image/png;base64,"
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        )
+        self.database.save_day(
+            {"date": self.today, "reflection": "原先写在今日感悟里"}
+        )
+        image = self.database.create_note_image(
+            {
+                "owner_type": "day",
+                "owner_key": self.today,
+                "original": tiny_png,
+                "thumbnail": tiny_png,
+                "width": 1,
+                "height": 1,
+            }
+        )
+        connection = self.database.connect()
+        try:
+            connection.execute(
+                "DELETE FROM app_settings WHERE key = 'daily_notes_merged'"
+            )
+            self.database._merge_daily_notes(connection)
+            connection.commit()
+        finally:
+            connection.close()
+
+        day = self.database.get_day(self.today)
+        merged = [
+            item
+            for item in self.database.list_memos("")
+            if item.get("kind") == "memo" and item["content"] == "原先写在今日感悟里"
+        ]
+        self.assertEqual(day["day"]["reflection"], "")
+        self.assertEqual(day["day"]["images"], [])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["images"][0]["id"], image["id"])
+
+        connection = self.database.connect()
+        try:
+            connection.execute(
+                "DELETE FROM app_settings WHERE key = 'daily_notes_merged'"
+            )
+            self.database._merge_daily_notes(connection)
+            connection.commit()
+        finally:
+            connection.close()
+        again = [
+            item
+            for item in self.database.list_memos("")
+            if item.get("kind") == "memo" and item["content"] == "原先写在今日感悟里"
+        ]
+        self.assertEqual(len(again), 1)
+
 if __name__ == "__main__":
     unittest.main()

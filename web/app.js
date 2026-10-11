@@ -344,14 +344,12 @@ function renderDay() {
           : `${current.getFullYear()} 年`;
   $("#backToday").hidden = state.date === today;
   $("#focusInput").value = state.day.day.focus || "";
-  $("#reflectionInput").value = state.day.day.reflection || "";
   updateMoodButtons();
   renderProjectOptions();
   renderTasks();
   renderTodayRoutines();
   renderSummary();
   renderWorklog();
-  renderDayImages();
   renderTodayMemos();
   renderRunningBar();
 
@@ -1443,7 +1441,7 @@ function scheduleDaySave() {
   const snapshot = {
     date: state.date,
     focus: $("#focusInput").value,
-    reflection: $("#reflectionInput").value,
+    reflection: state.day?.day?.reflection || "",
     mood: state.mood,
   };
   $("#daySaveStatus").textContent = "等待保存…";
@@ -1477,7 +1475,7 @@ function updateMoodButtons() {
 
 function openCloseDay() {
   if (!state.day) return;
-  $("#closeReflection").value = $("#reflectionInput").value;
+  $("#closeReflection").value = state.day.day.reflection || "";
   state.closeMood = state.mood;
   renderCloseMood();
   renderCloseTasks();
@@ -2651,7 +2649,6 @@ function bindEvents() {
   });
 
   $("#focusInput").addEventListener("input", scheduleDaySave);
-  $("#reflectionInput").addEventListener("input", scheduleDaySave);
   $$("[data-mood]").forEach((button) => {
     button.addEventListener("click", () => {
       state.mood = Number(button.dataset.mood);
@@ -2686,19 +2683,16 @@ function bindEvents() {
     );
     if (input) applyTagPreset(input, preset.dataset.tag);
   });
-  bindImageInput($("#dayImageInput"), (files) => addDayImages(files));
   bindImageInput($("#quickImageInput"), (files) => addFilesToBucket(files, "quick"));
   bindImageInput($("#composeImageInput"), (files) =>
     addFilesToBucket(files, "compose"),
   );
   bindImageInput($("#memoEditImageInput"), (files) => addMemoEditImages(files));
-  bindImageDrop($(".reflection-panel"), (files) => addDayImages(files));
   bindImageDrop($(".quick-memo-panel"), (files) => addFilesToBucket(files, "quick"));
   bindImageDrop($(".memo-compose-panel"), (files) =>
     addFilesToBucket(files, "compose"),
   );
   bindImageDrop($("#memoDialog"), (files) => addMemoEditImages(files));
-  bindImagePaste($("#reflectionInput"), (files) => addDayImages(files));
   bindImagePaste($("#quickMemoContent"), (files) => addFilesToBucket(files, "quick"));
   bindImagePaste($("#memoContent"), (files) => addFilesToBucket(files, "compose"));
   bindImagePaste($("#memoEditContent"), (files) => addMemoEditImages(files));
