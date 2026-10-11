@@ -54,6 +54,16 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def valid_remind_at(value: object) -> str:
+    if not isinstance(value, str):
+        raise AppError("请选择提醒的日期和时间")
+    try:
+        parsed = datetime.strptime(value.strip(), "%Y-%m-%dT%H:%M")
+    except ValueError as exc:
+        raise AppError("请选择提醒的日期和时间") from exc
+    return parsed.strftime("%Y-%m-%dT%H:%M")
+
+
 def valid_date(value: object, field_name: str = "日期") -> str:
     if not isinstance(value, str):
         raise AppError(f"{field_name}格式不正确")
@@ -269,6 +279,19 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS note_images_by_owner
                 ON note_images(owner_type, owner_key, id);
+
+                CREATE TABLE IF NOT EXISTS reminders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message TEXT NOT NULL,
+                    remind_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'done')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS reminders_by_time
+                ON reminders(status, remind_at);
 
                 CREATE TABLE IF NOT EXISTS app_settings (
                     key TEXT PRIMARY KEY,
@@ -1141,6 +1164,106 @@ class Database:
             )
         for image_id in image_ids:
             self._remove_image_files(image_id)
+
+    def list_reminders(self) -> list[dict]:
+        cutoff = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M")
+        with closing(self.connect()) as db:
+            return [
+                self._reminder_dict(row)
+                for row in db.execute(
+                    """
+                    SELECT * FROM reminders
+                    WHERE status = 'pending' OR remind_at >= ?
+                    ORDER BY
+                        CASE status WHEN 'pending' THEN 0 ELSE 1 END,
+                        remind_at,
+                        id
+                    """,
+                    (cutoff,),
+                )
+            ]
+
+    def create_reminder(self, payload: dict) -> dict:
+        message = self._reminder_message(payload.get("message"))
+        remind_at = valid_remind_at(payload.get("remind_at"))
+        self._require_future_reminder(remind_at)
+        now = utc_now()
+        with closing(self.connect()) as db, db:
+            cursor = db.execute(
+                """
+                INSERT INTO reminders(message, remind_at, status, created_at, updated_at)
+                VALUES (?, ?, 'pending', ?, ?)
+                """,
+                (message, remind_at, now, now),
+            )
+            row = db.execute(
+                "SELECT * FROM reminders WHERE id = ?", (cursor.lastrowid,)
+            ).fetchone()
+            return self._reminder_dict(row)
+
+    def update_reminder(self, reminder_id: int, payload: dict) -> dict:
+        with closing(self.connect()) as db, db:
+            current = db.execute(
+                "SELECT * FROM reminders WHERE id = ?", (reminder_id,)
+            ).fetchone()
+            if not current:
+                raise AppError("没有找到这个提醒", HTTPStatus.NOT_FOUND)
+            message = current["message"]
+            remind_at = current["remind_at"]
+            status = current["status"]
+            if "message" in payload:
+                message = self._reminder_message(payload.get("message"))
+                status = "pending"
+            if "remind_at" in payload:
+                remind_at = valid_remind_at(payload.get("remind_at"))
+                self._require_future_reminder(remind_at)
+                status = "pending"
+            if "status" in payload:
+                status = str(payload.get("status"))
+                if status not in {"pending", "done"}:
+                    raise AppError("提醒状态不正确")
+            db.execute(
+                """
+                UPDATE reminders
+                SET message = ?, remind_at = ?, status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (message, remind_at, status, utc_now(), reminder_id),
+            )
+            row = db.execute(
+                "SELECT * FROM reminders WHERE id = ?", (reminder_id,)
+            ).fetchone()
+            return self._reminder_dict(row)
+
+    def delete_reminder(self, reminder_id: int) -> None:
+        with closing(self.connect()) as db, db:
+            cursor = db.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+            if cursor.rowcount == 0:
+                raise AppError("没有找到这个提醒", HTTPStatus.NOT_FOUND)
+
+    @staticmethod
+    def _reminder_dict(row: sqlite3.Row) -> dict:
+        return {
+            "id": int(row["id"]),
+            "message": row["message"],
+            "remind_at": row["remind_at"],
+            "status": row["status"],
+        }
+
+    @staticmethod
+    def _reminder_message(value: object) -> str:
+        message = str(value or "").strip()
+        if not message:
+            raise AppError("先写下要提醒的内容")
+        if len(message) > 200:
+            raise AppError("提醒内容请控制在 200 个字以内")
+        return message
+
+    @staticmethod
+    def _require_future_reminder(remind_at: str) -> None:
+        current = datetime.now().strftime("%Y-%m-%dT%H:%M")
+        if remind_at < current:
+            raise AppError("请选一个还没到的时间")
 
     @property
     def image_dir(self) -> Path:
@@ -2663,6 +2786,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         if method == "POST" and path == "/api/memos":
             self._json(self.database.create_memo(self._body()), HTTPStatus.CREATED)
             return
+        if method == "GET" and path == "/api/reminders":
+            self._json(self.database.list_reminders())
+            return
+        if method == "POST" and path == "/api/reminders":
+            self._json(
+                self.database.create_reminder(self._body()), HTTPStatus.CREATED
+            )
+            return
         if method == "GET" and path == "/api/tags/suggested":
             self._json({"tags": self.database.suggested_tags()})
             return
@@ -2789,6 +2920,19 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._json({"deleted": True})
                 return
 
+        reminder_prefix = "/api/reminders/"
+        if path.startswith(reminder_prefix):
+            suffix = path[len(reminder_prefix) :].strip("/")
+            if "/" in suffix or not suffix.isdigit():
+                raise AppError("没有找到这个操作", HTTPStatus.NOT_FOUND)
+            reminder_id = int(suffix)
+            if method == "PATCH":
+                self._json(self.database.update_reminder(reminder_id, self._body()))
+                return
+            if method == "DELETE":
+                self.database.delete_reminder(reminder_id)
+                self._json({"deleted": True})
+                return
         memo_prefix = "/api/memos/"
         if path.startswith(memo_prefix):
             suffix = path[len(memo_prefix) :].strip("/")

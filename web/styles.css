@@ -1746,6 +1746,107 @@ h3 {
   min-width: 0;
 }
 
+.reminder-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 148px 112px auto;
+  gap: 8px;
+  padding: 0 20px 16px;
+}
+
+.reminder-form input {
+  min-width: 0;
+}
+
+.reminder-list {
+  display: grid;
+  gap: 8px;
+  max-height: 320px;
+  padding: 0 20px 18px;
+  overflow: auto;
+}
+
+.reminder-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.reminder-card,
+.reminder-edit,
+.reminder-alert-list article {
+  display: grid;
+  gap: 4px 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #fff;
+}
+
+.reminder-card {
+  grid-template-columns: 112px minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.reminder-card time,
+.reminder-alert-list time {
+  color: var(--green-dark);
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.reminder-card p,
+.reminder-alert-list p {
+  margin: 0;
+  font-size: 14px;
+}
+
+.reminder-card.is-due {
+  border-color: #e4c56a;
+  background: var(--yellow-soft);
+}
+
+.reminder-card.is-done {
+  opacity: 0.62;
+}
+
+.reminder-card.is-done time::after {
+  content: " · 已提醒";
+  color: var(--muted);
+  font-weight: 650;
+}
+
+.reminder-actions,
+.reminder-edit-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.reminder-actions button,
+.reminder-edit-actions button {
+  min-height: 28px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 999px;
+  color: var(--green);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.reminder-edit {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.reminder-edit input {
+  min-width: 0;
+}
+
+.reminder-alert-list {
+  display: grid;
+  gap: 8px;
+}
+
 .memo-filter-summary {
   min-height: 25px;
   color: var(--muted);
@@ -1916,6 +2017,11 @@ h3 {
 }
 
 @media (max-width: 720px) {
+  .reminder-form,
+  .reminder-card {
+    grid-template-columns: 1fr;
+  }
+
   .app-header {
     grid-template-columns: auto minmax(0, 1fr) auto;
     padding: 9px 16px;

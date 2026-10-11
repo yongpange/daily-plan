@@ -510,5 +510,40 @@ class DatabaseTests(unittest.TestCase):
         ]
         self.assertEqual(len(again), 1)
 
+    def test_reminders_can_be_created_updated_and_removed(self):
+        created = self.database.create_reminder(
+            {"message": "  回信  ", "remind_at": "2099-10-15T09:30"}
+        )
+        self.assertEqual(created["message"], "回信")
+        self.assertEqual(created["remind_at"], "2099-10-15T09:30")
+        self.assertEqual(created["status"], "pending")
+
+        with self.assertRaises(AppError):
+            self.database.create_reminder(
+                {"message": "太早了", "remind_at": "2000-01-01T09:30"}
+            )
+        with self.assertRaises(AppError):
+            self.database.create_reminder({"message": "   ", "remind_at": "2099-10-15T09:30"})
+
+        updated = self.database.update_reminder(
+            created["id"],
+            {"message": "改到下午", "remind_at": "2099-10-15T15:00"},
+        )
+        self.assertEqual(updated["message"], "改到下午")
+        self.assertEqual(updated["remind_at"], "2099-10-15T15:00")
+        done = self.database.update_reminder(created["id"], {"status": "done"})
+        self.assertEqual(done["status"], "done")
+        self.assertTrue(
+            any(item["id"] == created["id"] for item in self.database.list_reminders())
+        )
+
+        self.database.delete_reminder(created["id"])
+        self.assertFalse(
+            any(item["id"] == created["id"] for item in self.database.list_reminders())
+        )
+        with self.assertRaises(AppError):
+            self.database.delete_reminder(created["id"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -610,6 +610,28 @@
           </section>
 
           <section class="memo-feed-section">
+            <section class="panel reminder-panel">
+              <div class="panel-header compact-header">
+                <div>
+                  <p class="eyebrow">到点再看</p>
+                  <h2>提醒</h2>
+                </div>
+                <span id="reminderCount" class="autosave-label"></span>
+              </div>
+              <form id="reminderForm" class="reminder-form">
+                <input
+                  id="reminderMessage"
+                  type="text"
+                  maxlength="200"
+                  required
+                  placeholder="提醒我什么，例如：给供应商回信"
+                />
+                <input id="reminderDate" type="date" required aria-label="提醒日期" />
+                <input id="reminderTime" type="time" required aria-label="提醒时间" />
+                <button type="submit" class="button primary">添加提醒</button>
+              </form>
+              <div id="reminderList" class="reminder-list"></div>
+            </section>
             <div id="memoFilterSummary" class="memo-filter-summary"></div>
             <div id="memoFeed" class="memo-feed"></div>
           </section>
@@ -792,6 +814,23 @@
           <button class="button subtle" value="cancel">取消</button>
           <button id="submitRoutineGate" type="submit" class="button primary">
             提交答案
+          </button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="reminderAlert" class="dialog reminder-alert">
+      <form method="dialog">
+        <div class="dialog-header">
+          <div>
+            <p class="eyebrow">到点了</p>
+            <h2>该看一下这些提醒</h2>
+          </div>
+        </div>
+        <div id="reminderAlertList" class="reminder-alert-list"></div>
+        <div class="dialog-actions">
+          <button id="acknowledgeReminders" type="submit" class="button primary" value="ack">
+            知道了
           </button>
         </div>
       </form>

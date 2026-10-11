@@ -26,6 +26,9 @@ const state = {
   pendingComposeImages: [],
   quickMemoDraftId: null,
   composeMemoDraftId: null,
+  reminders: [],
+  editingReminderId: null,
+  alertedReminderIds: new Set(),
   suggestedTags: [],
   viewerImages: [],
   viewerIndex: 0,
@@ -287,6 +290,7 @@ function switchView(view) {
   if (state.view === "memos") {
     $("#memoDate").value = localDateString(new Date());
     loadMemos();
+    refreshReminders();
     refreshGlobalTimer();
   }
   if (state.view === "settings") loadSettings();
@@ -2551,6 +2555,236 @@ function renderRoutineBoard() {
     </div>`;
 }
 
+function localMinute(date = new Date()) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${localDateString(date)}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function prepareReminderForm() {
+  const next = new Date();
+  next.setMinutes(0, 0, 0);
+  next.setHours(next.getHours() + 1);
+  $("#reminderDate").value = localDateString(next);
+  $("#reminderTime").value = `${String(next.getHours()).padStart(2, "0")}:${String(next.getMinutes()).padStart(2, "0")}`;
+}
+
+function reminderStamp(reminder) {
+  return `${reminder.remind_at.slice(0, 10)}T${reminder.remind_at.slice(11, 16)}`;
+}
+
+function formatReminderWhen(value) {
+  const date = value.slice(0, 10);
+  const time = value.slice(11, 16);
+  const today = localDateString(new Date());
+  let day = date;
+  if (date === today) day = "今天";
+  else if (date === shiftDate(today, 1)) day = "明天";
+  else if (date === shiftDate(today, -1)) day = "昨天";
+  else {
+    const parsed = parseLocalDate(date);
+    day = new Intl.DateTimeFormat("zh-CN", {
+      month: "long",
+      day: "numeric",
+    }).format(parsed);
+  }
+  return `${day} ${time}`;
+}
+
+function renderReminders() {
+  const list = $("#reminderList");
+  const pending = state.reminders.filter((item) => item.status === "pending");
+  $("#reminderCount").textContent = pending.length ? `${pending.length} 个待提醒` : "";
+  if (!state.reminders.length) {
+    list.innerHTML =
+      '<p class="reminder-empty">还没有提醒。选一个时间和一句话，到点会响。</p>';
+    return;
+  }
+  const now = localMinute();
+  list.innerHTML = state.reminders
+    .map((reminder) => {
+      const due = reminder.status === "pending" && reminderStamp(reminder) <= now;
+      if (state.editingReminderId === reminder.id) {
+        const [date, time] = reminder.remind_at.split("T");
+        return `
+          <form class="reminder-edit" data-reminder-edit="${reminder.id}">
+            <input name="message" type="text" maxlength="200" required value="${escapeHtml(reminder.message)}" />
+            <input name="date" type="date" required value="${escapeHtml(date)}" aria-label="提醒日期" />
+            <input name="time" type="time" required value="${escapeHtml(time)}" aria-label="提醒时间" />
+            <div class="reminder-edit-actions">
+              <button type="submit" class="button primary compact">保存</button>
+              <button type="button" class="button subtle compact" data-reminder-action="cancel-edit" data-reminder-id="${reminder.id}">取消</button>
+            </div>
+          </form>`;
+      }
+      return `
+        <article class="reminder-card ${due ? "is-due" : ""} ${reminder.status === "done" ? "is-done" : ""}">
+          <time>${escapeHtml(formatReminderWhen(reminder.remind_at))}</time>
+          <p>${escapeHtml(reminder.message)}</p>
+          <div class="reminder-actions">
+            ${
+              due
+                ? `<button type="button" data-reminder-action="done" data-reminder-id="${reminder.id}">知道了</button>`
+                : ""
+            }
+            <button type="button" data-reminder-action="edit" data-reminder-id="${reminder.id}">编辑</button>
+            <button type="button" data-reminder-action="delete" data-reminder-id="${reminder.id}">删除</button>
+          </div>
+        </article>`;
+    })
+    .join("");
+}
+
+async function refreshReminders() {
+  try {
+    state.reminders = await api("/api/reminders");
+    if (state.view === "memos" && state.editingReminderId == null) renderReminders();
+    const now = localMinute();
+    const due = state.reminders.filter(
+      (item) => item.status === "pending" && reminderStamp(item) <= now,
+    );
+    const fresh = due.filter((item) => !state.alertedReminderIds.has(item.id));
+    fresh.forEach((item) => state.alertedReminderIds.add(item.id));
+    if (fresh.length) notifyDueReminders(fresh);
+    const alert = $("#reminderAlert");
+    if (due.length && fresh.length && !alert.open) {
+      $("#reminderAlertList").innerHTML = due
+        .map(
+          (item) => `
+            <article>
+              <time>${escapeHtml(formatReminderWhen(item.remind_at))}</time>
+              <p>${escapeHtml(item.message)}</p>
+            </article>`,
+        )
+        .join("");
+      alert.returnValue = "";
+      try {
+        alert.showModal();
+      } catch {
+        fresh.forEach((item) => state.alertedReminderIds.delete(item.id));
+      }
+    }
+  } catch {
+    // 轮询失败时不打断当前操作，下一轮会再试。
+  }
+}
+
+function notifyDueReminders(reminders) {
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  reminders.forEach((item) => {
+    const notice = new Notification("到点了", { body: item.message, tag: `reminder-${item.id}` });
+    notice.onclick = () => window.focus();
+  });
+}
+
+async function requestReminderPermission() {
+  if (!("Notification" in window) || Notification.permission !== "default") return;
+  try {
+    await Notification.requestPermission();
+  } catch {
+    // 浏览器不允许时，页面里的提醒框仍然可用。
+  }
+}
+
+async function submitReminder(event) {
+  event.preventDefault();
+  const message = $("#reminderMessage").value.trim();
+  const remindAt = `${$("#reminderDate").value}T${$("#reminderTime").value}`;
+  if (!message || !$("#reminderDate").value || !$("#reminderTime").value) {
+    notify("先写下内容，并选好日期和时间", true);
+    return;
+  }
+  const button = event.submitter;
+  setBusy(button, true, "添加中…");
+  try {
+    await api("/api/reminders", {
+      method: "POST",
+      body: JSON.stringify({ message, remind_at: remindAt }),
+    });
+    $("#reminderMessage").value = "";
+    prepareReminderForm();
+    await requestReminderPermission();
+    await refreshReminders();
+    renderReminders();
+    notify("提醒已设好");
+  } catch (error) {
+    reportError(error);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function saveReminderEdit(form) {
+  const reminderId = Number(form.dataset.reminderEdit);
+  const message = form.elements.message.value.trim();
+  const remindAt = `${form.elements.date.value}T${form.elements.time.value}`;
+  try {
+    await api(`/api/reminders/${reminderId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ message, remind_at: remindAt }),
+    });
+    state.editingReminderId = null;
+    state.alertedReminderIds.delete(reminderId);
+    await refreshReminders();
+    renderReminders();
+    notify("提醒已更新");
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+async function deleteReminder(reminderId, button) {
+  if (!window.confirm("确定删掉这个提醒吗？")) return;
+  setBusy(button, true, "删除中…");
+  try {
+    await api(`/api/reminders/${reminderId}`, { method: "DELETE" });
+    if (state.editingReminderId === reminderId) state.editingReminderId = null;
+    state.alertedReminderIds.delete(reminderId);
+    await refreshReminders();
+    renderReminders();
+    notify("提醒已删除");
+  } catch (error) {
+    reportError(error);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function acknowledgeReminder(reminderId) {
+  try {
+    await api(`/api/reminders/${reminderId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ status: "done" }),
+    });
+    state.alertedReminderIds.delete(reminderId);
+    await refreshReminders();
+    if (state.view === "memos") renderReminders();
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+async function acknowledgeOpenReminders() {
+  const now = localMinute();
+  const due = state.reminders.filter(
+    (item) => item.status === "pending" && reminderStamp(item) <= now,
+  );
+  try {
+    await Promise.all(
+      due.map((item) =>
+        api(`/api/reminders/${item.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ status: "done" }),
+        }),
+      ),
+    );
+    due.forEach((item) => state.alertedReminderIds.delete(item.id));
+    await refreshReminders();
+    if (state.view === "memos") renderReminders();
+  } catch (error) {
+    reportError(error);
+  }
+}
+
 function bindEvents() {
   $$(".nav-button").forEach((button) => {
     button.addEventListener("click", () => switchView(button.dataset.view));
@@ -2835,6 +3069,40 @@ function bindEvents() {
   $("#unlockRoutines").addEventListener("click", openRoutineGate);
   $("#routineGateForm").addEventListener("submit", submitRoutineGate);
   $("#routineCreateForm").addEventListener("submit", createRoutine);
+  prepareReminderForm();
+  $("#reminderForm").addEventListener("submit", submitReminder);
+  $("#reminderList").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-reminder-action]");
+    if (!button) return;
+    const reminderId = Number(button.dataset.reminderId);
+    if (button.dataset.reminderAction === "edit") {
+      state.editingReminderId = reminderId;
+      renderReminders();
+    }
+    if (button.dataset.reminderAction === "cancel-edit") {
+      state.editingReminderId = null;
+      renderReminders();
+    }
+    if (button.dataset.reminderAction === "delete") {
+      deleteReminder(reminderId, button);
+    }
+    if (button.dataset.reminderAction === "done") {
+      acknowledgeReminder(reminderId);
+    }
+  });
+  $("#reminderList").addEventListener("submit", (event) => {
+    const form = event.target.closest("[data-reminder-edit]");
+    if (!form) return;
+    event.preventDefault();
+    saveReminderEdit(form);
+  });
+  $("#reminderAlert").addEventListener("close", () => {
+    if ($("#reminderAlert").returnValue !== "ack") return;
+    acknowledgeOpenReminders();
+  });
+  $("#acknowledgeReminders").addEventListener("click", () => {
+    $("#reminderAlert").returnValue = "ack";
+  });
   $("#routineSettingsList").addEventListener("click", async (event) => {
     const button = event.target.closest("[data-routine-action]");
     if (!button) return;
@@ -2854,7 +3122,12 @@ function initialize() {
   renderBreakBar();
   loadSettings();
   loadSuggestedTags();
+  refreshReminders();
   switchView(state.view);
+  window.setInterval(refreshReminders, 15000);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") refreshReminders();
+  });
   syncStickyOffset();
   window.addEventListener("resize", syncStickyOffset);
   window.setInterval(updateLiveTimers, 1000);
