@@ -103,6 +103,76 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(tomorrow["entries"][0]["estimate_minutes"], 45)
         self.assertEqual(week["reasons"][0]["label"], "估时偏短")
 
+    def test_unfinished_task_is_cut_onto_a_later_day(self):
+        target = date.fromordinal(
+            max(date.today().toordinal(), date(2026, 10, 11).toordinal()) + 1
+        ).isoformat()
+        entry = self.add_entry("还没做完的方案", estimate=45)
+
+        moved = self.database.move_entry(entry["id"], {"date": target})
+        source = self.database.get_day(self.today)
+        destination = self.database.get_day(target)
+
+        self.assertEqual(moved["moved_to"], target)
+        self.assertEqual(source["entries"], [])
+        self.assertEqual(destination["entries"][0]["title"], "还没做完的方案")
+        self.assertEqual(destination["entries"][0]["outcome"], "planned")
+        self.assertEqual(destination["entries"][0]["estimate_minutes"], 45)
+        with self.assertRaises(AppError):
+            self.database.move_entry(destination["entries"][0]["id"], {"date": self.today})
+
+    def test_logged_time_stays_on_the_original_day_when_task_moves(self):
+        target = date.fromordinal(
+            max(date.today().toordinal(), date(2026, 10, 11).toordinal()) + 1
+        ).isoformat()
+        entry = self.add_entry("做了一半", estimate=30)
+        self.database.start_timer(entry["id"])
+        with self.assertRaises(AppError):
+            self.database.move_entry(entry["id"], {"date": target})
+        self.database.stop_timer(entry["id"])
+
+        self.database.move_entry(entry["id"], {"date": target})
+        source = self.database.get_day(self.today)
+        destination = self.database.get_day(target)
+
+        self.assertEqual(source["entries"][0]["outcome"], "rescheduled")
+        self.assertEqual(source["entries"][0]["estimate_minutes"], 0)
+        self.assertEqual(source["segments"][0]["title"], "做了一半")
+        self.assertEqual(destination["entries"][0]["title"], "做了一半")
+        self.assertEqual(destination["entries"][0]["outcome"], "planned")
+        self.assertEqual(destination["entries"][0]["estimate_minutes"], 30)
+
+    def test_moving_the_last_child_takes_its_parent_along(self):
+        target = date.fromordinal(
+            max(date.today().toordinal(), date(2026, 10, 11).toordinal()) + 1
+        ).isoformat()
+        parent = self.add_entry("整组还没做完")
+        child = self.add_entry("其中一步", parent_entry_id=parent["id"])
+        sibling = self.add_entry("另一步", parent_entry_id=parent["id"])
+
+        self.database.move_entry(child["id"], {"date": target})
+        source = self.database.get_day(self.today)
+        destination = self.database.get_day(target)
+        source_titles = {item["title"] for item in source["entries"]}
+        destination_titles = {item["title"] for item in destination["entries"]}
+
+        self.assertIn("另一步", source_titles)
+        self.assertIn("整组还没做完", source_titles)
+        self.assertNotIn("其中一步", source_titles)
+        self.assertEqual(destination_titles, {"整组还没做完", "其中一步"})
+
+        self.database.move_entry(sibling["id"], {"date": target})
+        source_after = self.database.get_day(self.today)
+        destination_after = self.database.get_day(target)
+
+        self.assertFalse(
+            any(item["outcome"] == "planned" for item in source_after["entries"])
+        )
+        self.assertEqual(
+            {item["title"] for item in destination_after["entries"]},
+            {"整组还没做完", "其中一步", "另一步"},
+        )
+
     def test_parent_is_resolved_from_child_decisions(self):
         parent = self.add_entry("制作页面", estimate=120)
         child = self.add_entry(
@@ -551,6 +621,107 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(updated["outcome"], "completed")
         self.assertEqual(day["entries"][0]["title"], "写完复盘明细")
         self.assertEqual(day["entries"][0]["outcome"], "completed")
+
+    def test_segments_in_a_week_keep_their_task_and_time(self):
+        entry = self.add_entry("对照时间轴")
+        self.database.start_timer(entry["id"])
+        self.database.stop_timer(entry["id"])
+
+        rows = self.database.list_segments_between("2026-10-05", "2026-10-11")
+
+        self.assertEqual(rows[0]["title"], "对照时间轴")
+        self.assertEqual(rows[0]["plan_date"], self.today)
+        self.assertEqual(rows[0]["entry_id"], entry["id"])
+        self.assertIn("estimate_minutes", rows[0])
+        self.assertTrue(rows[0]["start_at"])
+        self.assertTrue(rows[0]["end_at"])
+        with self.assertRaises(AppError):
+            self.database.list_segments_between("2026-10-11", "2026-10-05")
+
+
+class TaskNoteTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.database = Database(Path(self.temp_dir.name) / "test.sqlite3")
+        self.today = "2026-10-10"
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def add_entry(self, title, estimate=60, **extra):
+        return self.database.create_entry(
+            {
+                "date": self.today,
+                "title": title,
+                "estimate_minutes": estimate,
+                **extra,
+            }
+        )
+
+    def test_task_note_keeps_title_estimate_and_actual_time(self):
+        parent = self.add_entry("主任务留下感悟", estimate=180)
+        child = self.add_entry(
+            "子步骤",
+            estimate=60,
+            parent_entry_id=parent["id"],
+        )
+        self.add_entry("另一个子步骤", estimate=90, parent_entry_id=parent["id"])
+        self.database.start_timer(child["id"])
+        self.database.stop_timer(child["id"])
+        child_after = next(
+            item
+            for item in self.database.get_day(self.today)["entries"]
+            if item["id"] == child["id"]
+        )
+
+        memo = self.database.create_memo(
+            {
+                "entry_id": parent["id"],
+                "content_format": "rich",
+                "content": "<p>做成了<strong>关键一步</strong></p>",
+                "tags": "复盘",
+            }
+        )
+
+        self.assertEqual(memo["source_title"], "主任务留下感悟")
+        self.assertEqual(memo["source_entry_id"], parent["id"])
+        self.assertEqual(memo["source_estimate_minutes"], 150)
+        self.assertEqual(memo["source_actual_seconds"], child_after["actual_seconds"])
+        self.assertEqual(memo["source_plan_date"], self.today)
+        self.assertEqual(memo["memo_date"], self.today)
+        self.assertIn("关键一步", memo["content"])
+        self.assertEqual(self.database.list_memos("主任务留下感悟")[0]["id"], memo["id"])
+        with self.assertRaises(AppError):
+            self.database.create_memo(
+                {"entry_id": child["id"], "content": "子任务不单独记"}
+            )
+
+    def test_rich_memo_drops_unsafe_markup(self):
+        memo = self.database.create_memo(
+            {
+                "date": self.today,
+                "content_format": "rich",
+                "content": '<p class="note-lg" onclick="alert(1)">重点<script>bad()</script></p>',
+            }
+        )
+
+        self.assertIn("重点", memo["content"])
+        self.assertIn("note-lg", memo["content"])
+        self.assertNotIn("script", memo["content"].lower())
+        self.assertNotIn("onclick", memo["content"])
+
+    def test_memo_templates_can_be_saved_and_removed(self):
+        created = self.database.create_memo_template(
+            {"name": "做完一个任务", "content": "<p>做成了【结果】</p>"}
+        )
+
+        self.assertEqual(created["name"], "做完一个任务")
+        self.assertIn("【结果】", created["content"])
+        self.assertEqual(self.database.list_memo_templates()[0]["id"], created["id"])
+        renamed = self.database.update_memo_template(created["id"], {"name": "任务复盘"})
+        self.assertEqual(renamed["name"], "任务复盘")
+        self.database.delete_memo_template(created["id"])
+        self.assertEqual(self.database.list_memo_templates(), [])
 
 
 if __name__ == "__main__":

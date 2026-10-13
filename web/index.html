@@ -232,12 +232,24 @@
                 </div>
               </div>
               <form id="quickMemoForm" class="quick-memo-form">
-                <textarea
-                  id="quickMemoContent"
-                  rows="4"
-                  maxlength="4000"
-                  placeholder="刚刚想到什么？每条只记一个念头。也可以直接粘贴或拖入图片。"
-                ></textarea>
+                <div class="rich-note">
+                  <div class="rich-note-toolbar" role="toolbar" aria-label="排版">
+                    <button type="button" data-command="bold">加粗</button>
+                    <button type="button" data-command="body">正文</button>
+                    <button type="button" data-command="large">大字</button>
+                    <button type="button" data-command="title">标题</button>
+                    <button type="button" data-command="list">列表</button>
+                    <button type="button" data-command="template">模板</button>
+                  </div>
+                  <div
+                    id="quickMemoContent"
+                    class="rich-note-body is-empty"
+                    contenteditable="true"
+                    role="textbox"
+                    aria-multiline="true"
+                    data-placeholder="刚刚想到什么？每条只记一个念头。也可以直接粘贴或拖入图片。"
+                  ></div>
+                </div>
                 <div class="image-composer">
                   <div id="quickImageStrip" class="image-strip"></div>
                   <label class="image-add" title="也可以直接粘贴或拖入图片">
@@ -345,8 +357,8 @@
           <section id="dayDetailPanel" class="panel day-detail-panel">
             <div class="panel-header">
               <div>
-                <p class="eyebrow">回头看一天</p>
-                <h2 id="dayDetailTitle">这一天完成了什么</h2>
+            <p class="eyebrow">时间都去哪了</p>
+            <h2 id="dayDetailTitle">这一周的时间</h2>
               </div>
               <div class="day-detail-controls">
                 <button id="dayDetailPrevious" class="icon-button" type="button" aria-label="前一天">←</button>
@@ -356,7 +368,7 @@
               </div>
             </div>
             <p id="dayDetailSummary" class="day-detail-summary"></p>
-            <div id="dayDetailList" class="day-detail-list"></div>
+            <div id="dayCalendar" class="day-calendar"></div>
           </section>
 
           <section class="panel routine-report-panel">
@@ -570,7 +582,7 @@
             <p class="eyebrow">让零散发现以后找得到</p>
             <h1>感悟库</h1>
           </div>
-          <div class="memo-search">
+            <div class="memo-search">
             <input
               id="memoSearchInput"
               type="search"
@@ -579,6 +591,7 @@
               aria-label="搜索感悟"
             />
             <button id="clearMemoSearch" class="button subtle compact">清除</button>
+            <button id="openMemoTemplates" type="button" class="button subtle compact">模板</button>
           </div>
         </div>
 
@@ -591,12 +604,24 @@
               </div>
             </div>
             <form id="memoComposeForm" class="memo-compose-form">
-              <textarea
-                id="memoContent"
-                rows="6"
-                maxlength="4000"
-                placeholder="一条记录只保留一个想法，以后更容易搜索和重组。也可以直接粘贴图片。"
-              ></textarea>
+              <div class="rich-note">
+                <div class="rich-note-toolbar" role="toolbar" aria-label="排版">
+                  <button type="button" data-command="bold">加粗</button>
+                  <button type="button" data-command="body">正文</button>
+                  <button type="button" data-command="large">大字</button>
+                  <button type="button" data-command="title">标题</button>
+                  <button type="button" data-command="list">列表</button>
+                  <button type="button" data-command="template">模板</button>
+                </div>
+                <div
+                  id="memoContent"
+                  class="rich-note-body is-empty"
+                  contenteditable="true"
+                  role="textbox"
+                  aria-multiline="true"
+                  data-placeholder="一条记录只保留一个想法，以后更容易搜索和重组。也可以直接粘贴图片。"
+                ></div>
+              </div>
               <div class="image-composer">
                 <div id="composeImageStrip" class="image-strip"></div>
                 <label class="image-add" title="也可以直接粘贴或拖入图片">
@@ -874,7 +899,24 @@
         </div>
         <label>
           <span>内容</span>
-          <textarea id="memoEditContent" rows="6" maxlength="4000" placeholder="也可以直接粘贴或拖入图片。"></textarea>
+          <div class="rich-note">
+            <div class="rich-note-toolbar" role="toolbar" aria-label="排版">
+              <button type="button" data-command="bold">加粗</button>
+              <button type="button" data-command="body">正文</button>
+              <button type="button" data-command="large">大字</button>
+              <button type="button" data-command="title">标题</button>
+              <button type="button" data-command="list">列表</button>
+              <button type="button" data-command="template">模板</button>
+            </div>
+            <div
+              id="memoEditContent"
+              class="rich-note-body is-empty"
+              contenteditable="true"
+              role="textbox"
+              aria-multiline="true"
+              data-placeholder="也可以直接粘贴或拖入图片。"
+            ></div>
+          </div>
         </label>
         <div class="image-composer">
           <div id="memoEditImageStrip" class="image-strip"></div>
@@ -911,6 +953,109 @@
         </div>
       </form>
     </dialog>
+
+    <dialog id="taskNoteDialog" class="dialog">
+      <form id="taskNoteForm">
+        <div class="dialog-header">
+          <div>
+            <p class="eyebrow">做完再记一句</p>
+            <h2 id="taskNoteTitle"></h2>
+            <p id="taskNoteMeta"></p>
+          </div>
+          <button id="closeTaskNote" class="dialog-close" type="button" aria-label="关闭">×</button>
+        </div>
+        <div class="rich-note">
+          <div class="rich-note-toolbar" role="toolbar" aria-label="排版">
+            <button type="button" data-command="bold">加粗</button>
+            <button type="button" data-command="body">正文</button>
+            <button type="button" data-command="large">大字</button>
+            <button type="button" data-command="title">标题</button>
+            <button type="button" data-command="list">列表</button>
+            <button type="button" data-command="template">模板</button>
+          </div>
+          <div
+            id="taskNoteContent"
+            class="rich-note-body is-empty"
+            contenteditable="true"
+            role="textbox"
+            aria-multiline="true"
+            data-placeholder="这个任务做完，真正留下的是什么？"
+          ></div>
+        </div>
+        <label>
+          <span>标签</span>
+          <input id="taskNoteTags" type="text" maxlength="300" placeholder="用逗号分隔，可留空" />
+          <div class="tag-presets" data-tag-input="taskNoteTags" hidden></div>
+        </label>
+        <p class="task-note-hint">保存后会出现在右侧随手记录和感悟库里，并带上这条任务的标题、预估和实际时间。</p>
+        <div class="dialog-actions">
+          <button id="cancelTaskNote" class="button subtle" type="button">取消</button>
+          <button type="submit" class="button primary">保存到感悟库</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="templateDialog" class="dialog">
+      <form id="templateForm">
+        <div class="dialog-header">
+          <div>
+            <p class="eyebrow">先把常用结构存好</p>
+            <h2>感悟模板</h2>
+            <p>用【收获】这样的括号标出要填的位置。使用时点一下，直接换成自己的话。</p>
+          </div>
+          <button id="closeTemplateDialog" class="dialog-close" type="button" aria-label="关闭">×</button>
+        </div>
+        <div id="templateList" class="template-list"></div>
+        <label>
+          <span>模板名称</span>
+          <input id="templateName" type="text" maxlength="40" placeholder="例如：做完一个任务" />
+        </label>
+        <div class="rich-note">
+          <div class="rich-note-toolbar" role="toolbar" aria-label="排版">
+            <button type="button" data-command="bold">加粗</button>
+            <button type="button" data-command="body">正文</button>
+            <button type="button" data-command="large">大字</button>
+            <button type="button" data-command="title">标题</button>
+            <button type="button" data-command="list">列表</button>
+          </div>
+          <div
+            id="templateContent"
+            class="rich-note-body is-empty"
+            contenteditable="true"
+            role="textbox"
+            aria-multiline="true"
+            data-placeholder="例如：做成了【结果】。卡点是【卡点】。下次先做【下一步】。"
+          ></div>
+        </div>
+        <div class="dialog-actions">
+          <button id="resetTemplateForm" class="button subtle" type="button">清空</button>
+          <button id="saveTemplate" type="submit" class="button primary">保存模板</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="segmentPopover" class="segment-popover" hidden>
+      <div class="segment-popover-actions">
+        <button type="button" id="editSegmentTask">编辑</button>
+        <button type="button" id="closeSegmentPopover">退出</button>
+      </div>
+      <h3 id="segmentPopoverTitle"></h3>
+      <p id="segmentPopoverWhen" class="segment-popover-when"></p>
+      <div class="segment-popover-meta">
+        <p id="segmentPopoverEstimate"></p>
+        <p id="segmentPopoverActual"></p>
+      </div>
+    </div>
+
+    <div id="moveTaskPopover" class="move-popover" hidden>
+      <p id="moveTaskTitle"></p>
+      <div id="moveTaskChoices" class="move-choices"></div>
+      <label class="move-custom">
+        <span>其他日期</span>
+        <input id="moveTaskDate" type="date" />
+      </label>
+      <p id="moveTaskNote" class="move-note"></p>
+    </div>
 
     <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
     <script src="/app.js" defer></script>

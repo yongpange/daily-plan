@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import html
 import json
 import logging
 import mimetypes
@@ -12,6 +13,7 @@ import secrets
 import sqlite3
 import threading
 import webbrowser
+from html.parser import HTMLParser
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from http import HTTPStatus
@@ -52,6 +54,135 @@ class AppError(Exception):
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+_RICH_TAGS = {"p", "br", "strong", "b", "ul", "ol", "li", "h3", "div"}
+_RICH_SIZE = {"note-lg", "note-title"}
+
+
+class _RichSanitizer(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.stack: list[str] = []
+        self.skip = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._open(tag, attrs, void=False)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._open(tag, attrs, void=True)
+
+    def _open(self, tag: str, attrs: list[tuple[str, str | None]], void: bool) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style"}:
+            self.skip += 1
+            return
+        if self.skip:
+            return
+        if tag in {"h1", "h2"}:
+            tag = "h3"
+        if tag not in _RICH_TAGS:
+            return
+        classes = []
+        for key, value in attrs:
+            if key == "class" and value:
+                classes = value.split()
+        if tag == "br":
+            self.parts.append("<br>")
+            return
+        if tag == "div":
+            tag = "p"
+        size = "note-title" if "note-title" in classes else "note-lg" if "note-lg" in classes else ""
+        if size and tag in {"p", "li", "h3"}:
+            self.parts.append(f'<{tag} class="{size}">')
+        else:
+            self.parts.append(f"<{tag}>")
+        if void:
+            self.parts.append(f"</{tag}>")
+        else:
+            self.stack.append(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style"}:
+            if self.skip:
+                self.skip -= 1
+            return
+        if self.skip:
+            return
+        if tag in {"h1", "h2"}:
+            tag = "h3"
+        if tag == "div":
+            tag = "p"
+        if tag == "br" or tag not in _RICH_TAGS:
+            return
+        if tag in self.stack:
+            while self.stack:
+                opened = self.stack.pop()
+                self.parts.append(f"</{opened}>")
+                if opened == tag:
+                    break
+
+    def handle_data(self, data: str) -> None:
+        if self.skip or not data:
+            return
+        self.parts.append(html.escape(data))
+
+    def result(self) -> str:
+        while self.stack:
+            self.parts.append(f"</{self.stack.pop()}>")
+        return "".join(self.parts)
+
+
+class _RichText(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.skip = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style"}:
+            self.skip += 1
+        if tag in {"p", "div", "br", "li", "h1", "h2", "h3"}:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in {"script", "style"} and self.skip:
+            self.skip -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self.skip:
+            self.parts.append(data)
+
+
+def sanitize_rich_html(value: str) -> str:
+    parser = _RichSanitizer()
+    parser.feed(value)
+    parser.close()
+    return parser.result().strip()
+
+
+def rich_plain_text(value: str) -> str:
+    parser = _RichText()
+    parser.feed(value)
+    parser.close()
+    return re.sub(r"\n{3,}", "\n\n", "".join(parser.parts)).strip()
+
+
+def memo_content_from_payload(payload: dict, current: str | None = None) -> str:
+    if current is not None and "content" not in payload and payload.get("content_format") != "rich":
+        return current
+    raw = str(payload.get("content", "") if current is None or "content" in payload else current).strip()
+    if payload.get("content_format") == "rich":
+        cleaned = sanitize_rich_html(raw)
+        if len(rich_plain_text(cleaned)) > 4000 or len(cleaned) > 12000:
+            raise AppError("单条感悟请控制在 4000 个字以内")
+        return cleaned
+    if len(raw) > 4000:
+        raise AppError("单条感悟请控制在 4000 个字以内")
+    return raw
 
 
 def valid_remind_at(value: object) -> str:
@@ -266,6 +397,14 @@ class Database:
                 CREATE INDEX IF NOT EXISTS memos_by_date
                 ON memos(memo_date DESC, created_at DESC);
 
+                CREATE TABLE IF NOT EXISTS memo_templates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS note_images (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     owner_type TEXT NOT NULL
@@ -340,6 +479,11 @@ class Database:
                 "focus_completed",
                 "INTEGER NOT NULL DEFAULT 0",
             )
+            self._ensure_column(db, "memos", "source_entry_id", "INTEGER")
+            self._ensure_column(db, "memos", "source_title", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(db, "memos", "source_estimate_minutes", "INTEGER")
+            self._ensure_column(db, "memos", "source_actual_seconds", "INTEGER")
+            self._ensure_column(db, "memos", "source_plan_date", "TEXT")
             self._ensure_image_ids(db)
             self._merge_daily_notes(db)
 
@@ -987,9 +1131,9 @@ class Database:
         clauses = []
         params: list[object] = []
         if clean_query:
-            clauses.append("(content LIKE ? OR tags LIKE ?)")
+            clauses.append("(content LIKE ? OR tags LIKE ? OR source_title LIKE ?)")
             wildcard = f"%{clean_query}%"
-            params.extend([wildcard, wildcard])
+            params.extend([wildcard, wildcard, wildcard])
         if memo_date:
             clauses.append("memo_date = ?")
             params.append(memo_date)
@@ -1001,6 +1145,8 @@ class Database:
                 for row in db.execute(
                     f"""
                     SELECT id, memo_date, content, tags, pinned,
+                           source_entry_id, source_title, source_estimate_minutes,
+                           source_actual_seconds, source_plan_date,
                            created_at, updated_at, 'memo' AS kind
                     FROM memos
                     {where}
@@ -1043,6 +1189,11 @@ class Database:
                         "content": row["reflection"],
                         "tags": "每日复盘",
                         "pinned": 0,
+                        "source_entry_id": None,
+                        "source_title": "",
+                        "source_estimate_minutes": None,
+                        "source_actual_seconds": None,
+                        "source_plan_date": None,
                         "created_at": row["updated_at"],
                         "updated_at": row["updated_at"],
                         "kind": "daily",
@@ -1072,25 +1223,112 @@ class Database:
             )
             return memos
 
+    def _memo_task_source(self, db: sqlite3.Connection, entry_id: int) -> dict:
+        root = db.execute(
+            """
+            SELECT pe.id, pe.plan_date, pe.estimate_minutes, t.id AS task_id,
+                   t.title, t.parent_id
+            FROM plan_entries pe
+            JOIN tasks t ON t.id = pe.task_id
+            WHERE pe.id = ?
+            """,
+            (entry_id,),
+        ).fetchone()
+        if not root:
+            raise AppError("没有找到这条任务", HTTPStatus.NOT_FOUND)
+        if root["parent_id"] is not None:
+            raise AppError("感悟写在主任务上")
+        nodes = [dict(root)]
+        frontier = [int(root["task_id"])]
+        while frontier:
+            placeholders = ",".join("?" * len(frontier))
+            children = db.execute(
+                f"""
+                SELECT pe.id, pe.estimate_minutes, t.id AS task_id, t.parent_id
+                FROM tasks t
+                JOIN plan_entries pe
+                  ON pe.task_id = t.id AND pe.plan_date = ?
+                WHERE t.parent_id IN ({placeholders})
+                """,
+                [root["plan_date"], *frontier],
+            ).fetchall()
+            frontier = []
+            for child in children:
+                nodes.append(dict(child))
+                frontier.append(int(child["task_id"]))
+        parent_task_ids = {
+            int(node["parent_id"]) for node in nodes if node["parent_id"] is not None
+        }
+        leaves = [
+            node for node in nodes if int(node["task_id"]) not in parent_task_ids
+        ]
+        estimate = sum(int(node["estimate_minutes"] or 0) for node in leaves)
+        entry_ids = [int(node["id"]) for node in nodes]
+        placeholders = ",".join("?" * len(entry_ids))
+        now = datetime.now(timezone.utc)
+        actual = 0
+        for segment in db.execute(
+            f"""
+            SELECT start_at, end_at, duration_seconds
+            FROM time_segments
+            WHERE plan_entry_id IN ({placeholders})
+            """,
+            entry_ids,
+        ):
+            if segment["end_at"]:
+                actual += int(segment["duration_seconds"] or 0)
+                continue
+            start = datetime.fromisoformat(str(segment["start_at"]).replace("Z", "+00:00"))
+            actual += max(0, int((now - start).total_seconds()))
+        return {
+            "source_entry_id": int(root["id"]),
+            "source_title": root["title"],
+            "source_estimate_minutes": estimate,
+            "source_actual_seconds": actual,
+            "source_plan_date": root["plan_date"],
+        }
+
     def create_memo(self, payload: dict) -> dict:
-        memo_date = valid_date(
-            payload.get("date") or date.today().isoformat(), "记录日期"
-        )
-        content = str(payload.get("content", "")).strip()
-        if not content and not payload.get("has_images"):
+        content = memo_content_from_payload(payload)
+        text = rich_plain_text(content) if payload.get("content_format") == "rich" else content.strip()
+        if not text and not payload.get("has_images"):
             raise AppError("先写下一点内容，或添加一张图片")
-        if len(content) > 4000:
-            raise AppError("单条感悟请控制在 4000 个字以内")
         tags = str(payload.get("tags", "")).strip()[:300]
         now = utc_now()
+        raw_entry = payload.get("entry_id")
         with closing(self.connect()) as db, db:
+            source = None
+            if raw_entry not in (None, ""):
+                try:
+                    entry_id = int(raw_entry)
+                except (TypeError, ValueError) as exc:
+                    raise AppError("任务不正确") from exc
+                source = self._memo_task_source(db, entry_id)
+            memo_date = (
+                source["source_plan_date"]
+                if source
+                else valid_date(payload.get("date") or date.today().isoformat(), "记录日期")
+            )
             cursor = db.execute(
                 """
                 INSERT INTO memos(
-                    memo_date, content, tags, pinned, created_at, updated_at
-                ) VALUES (?, ?, ?, 0, ?, ?)
+                    memo_date, content, tags, pinned, created_at, updated_at,
+                    source_entry_id, source_title, source_estimate_minutes,
+                    source_actual_seconds, source_plan_date
+                ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (memo_date, content, tags, now, now),
+                (
+                    memo_date,
+                    content,
+                    tags,
+                    now,
+                    now,
+                    None if source is None else source["source_entry_id"],
+                    "" if source is None else source["source_title"],
+                    None if source is None else source["source_estimate_minutes"],
+                    None if source is None else source["source_actual_seconds"],
+                    None if source is None else source["source_plan_date"],
+                ),
             )
             created = dict(
                 db.execute(
@@ -1108,8 +1346,13 @@ class Database:
             ).fetchone()
             if not current:
                 raise AppError("没有找到这条感悟", HTTPStatus.NOT_FOUND)
-            content = str(payload.get("content", current["content"])).strip()
-            if not content:
+            content = memo_content_from_payload(payload, str(current["content"]))
+            text = (
+                rich_plain_text(content)
+                if payload.get("content_format") == "rich" or "<" in content
+                else content.strip()
+            )
+            if not text:
                 has_images = db.execute(
                     """
                     SELECT EXISTS(
@@ -1133,7 +1376,7 @@ class Database:
                     updated_at = ?
                 WHERE id = ?
                 """,
-                (memo_date, content[:4000], tags, pinned, utc_now(), memo_id),
+                (memo_date, content[:12000], tags, pinned, utc_now(), memo_id),
             )
             updated = dict(
                 db.execute(
@@ -1164,6 +1407,94 @@ class Database:
             )
         for image_id in image_ids:
             self._remove_image_files(image_id)
+
+    def list_memo_templates(self) -> list[dict]:
+        with closing(self.connect()) as db:
+            return [
+                {
+                    "id": int(row["id"]),
+                    "name": row["name"],
+                    "content": row["content"],
+                    "updated_at": row["updated_at"],
+                }
+                for row in db.execute(
+                    """
+                    SELECT id, name, content, updated_at
+                    FROM memo_templates
+                    ORDER BY updated_at DESC, id DESC
+                    """
+                )
+            ]
+
+    def create_memo_template(self, payload: dict) -> dict:
+        name = str(payload.get("name", "")).strip()
+        if not name:
+            raise AppError("先给模板起个名字")
+        if len(name) > 40:
+            raise AppError("模板名称请控制在 40 个字以内")
+        content = memo_content_from_payload({**payload, "content_format": "rich"})
+        if not rich_plain_text(content):
+            raise AppError("模板里先写一点内容")
+        now = utc_now()
+        with closing(self.connect()) as db, db:
+            count = db.execute("SELECT COUNT(*) FROM memo_templates").fetchone()[0]
+            if int(count) >= 40:
+                raise AppError("模板最多保存 40 个")
+            cursor = db.execute(
+                """
+                INSERT INTO memo_templates(name, content, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (name, content, now, now),
+            )
+            return self._template_row(db, int(cursor.lastrowid))
+
+    def update_memo_template(self, template_id: int, payload: dict) -> dict:
+        with closing(self.connect()) as db, db:
+            current = db.execute(
+                "SELECT * FROM memo_templates WHERE id = ?", (template_id,)
+            ).fetchone()
+            if not current:
+                raise AppError("没有找到这个模板", HTTPStatus.NOT_FOUND)
+            name = str(payload.get("name", current["name"])).strip()
+            if not name or len(name) > 40:
+                raise AppError("模板名称请控制在 40 个字以内")
+            if "content" in payload:
+                content = memo_content_from_payload({**payload, "content_format": "rich"})
+                if not rich_plain_text(content):
+                    raise AppError("模板里先写一点内容")
+            else:
+                content = current["content"]
+            db.execute(
+                """
+                UPDATE memo_templates
+                SET name = ?, content = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (name, content, utc_now(), template_id),
+            )
+            return self._template_row(db, template_id)
+
+    def delete_memo_template(self, template_id: int) -> None:
+        with closing(self.connect()) as db, db:
+            cursor = db.execute(
+                "DELETE FROM memo_templates WHERE id = ?", (template_id,)
+            )
+            if cursor.rowcount == 0:
+                raise AppError("没有找到这个模板", HTTPStatus.NOT_FOUND)
+
+    @staticmethod
+    def _template_row(db: sqlite3.Connection, template_id: int) -> dict:
+        row = db.execute(
+            "SELECT id, name, content, updated_at FROM memo_templates WHERE id = ?",
+            (template_id,),
+        ).fetchone()
+        return {
+            "id": int(row["id"]),
+            "name": row["name"],
+            "content": row["content"],
+            "updated_at": row["updated_at"],
+        }
 
     def list_reminders(self) -> list[dict]:
         cutoff = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M")
@@ -1628,6 +1959,226 @@ class Database:
             )
         return self.get_day(plan_date)
 
+    def move_entry(self, entry_id: int, payload: dict) -> dict:
+        target_date = valid_date(payload.get("date"), "目标日期")
+        today = date.today().isoformat()
+        now = utc_now()
+        with closing(self.connect()) as db, db:
+            root = db.execute(
+                """
+                SELECT pe.id, pe.plan_date, pe.outcome, pe.estimate_minutes,
+                       pe.task_id, t.parent_id, t.title
+                FROM plan_entries pe
+                JOIN tasks t ON t.id = pe.task_id
+                WHERE pe.id = ?
+                """,
+                (entry_id,),
+            ).fetchone()
+            if not root:
+                raise AppError("没有找到这条任务", HTTPStatus.NOT_FOUND)
+            if root["outcome"] != "planned":
+                raise AppError("只有还没完成的任务可以移走")
+            source_date = root["plan_date"]
+            if target_date <= source_date:
+                raise AppError("只能移到更晚的一天")
+            if target_date < today:
+                raise AppError("只能移到今天或之后")
+
+            selected = [dict(root)]
+            frontier = [int(root["task_id"])]
+            while frontier:
+                placeholders = ",".join("?" * len(frontier))
+                children = db.execute(
+                    f"""
+                    SELECT pe.id, pe.plan_date, pe.outcome, pe.estimate_minutes,
+                           pe.task_id, t.parent_id, t.title
+                    FROM tasks t
+                    JOIN plan_entries pe
+                      ON pe.task_id = t.id AND pe.plan_date = ?
+                    WHERE t.parent_id IN ({placeholders})
+                      AND pe.outcome = 'planned'
+                    """,
+                    [source_date, *frontier],
+                ).fetchall()
+                frontier = []
+                for child in children:
+                    selected.append(dict(child))
+                    frontier.append(int(child["task_id"]))
+
+            climb_id = root["parent_id"]
+            while climb_id is not None:
+                parent_entry = db.execute(
+                    """
+                    SELECT pe.id, pe.plan_date, pe.outcome, pe.estimate_minutes,
+                           pe.task_id, t.parent_id, t.title
+                    FROM plan_entries pe
+                    JOIN tasks t ON t.id = pe.task_id
+                    WHERE pe.task_id = ? AND pe.plan_date = ?
+                    """,
+                    (climb_id, source_date),
+                ).fetchone()
+                if not parent_entry or parent_entry["outcome"] != "planned":
+                    break
+                selected_ids = [int(item["id"]) for item in selected]
+                placeholders = ",".join("?" * len(selected_ids))
+                others = db.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM plan_entries pe
+                    JOIN tasks t ON t.id = pe.task_id
+                    WHERE t.parent_id = ? AND pe.plan_date = ?
+                      AND pe.id NOT IN ({placeholders})
+                    """,
+                    [climb_id, source_date, *selected_ids],
+                ).fetchone()[0]
+                if int(others):
+                    break
+                selected.append(dict(parent_entry))
+                climb_id = parent_entry["parent_id"]
+
+            entry_ids = [int(item["id"]) for item in selected]
+            placeholders = ",".join("?" * len(entry_ids))
+            running = db.execute(
+                f"""
+                SELECT 1 FROM time_segments
+                WHERE plan_entry_id IN ({placeholders}) AND end_at IS NULL
+                """,
+                entry_ids,
+            ).fetchone()
+            if running:
+                raise AppError("先结束计时，再把任务移走")
+
+            moving_tasks = {int(item["task_id"]) for item in selected}
+            for item in selected:
+                parent_task = item["parent_id"]
+                while parent_task is not None and int(parent_task) not in moving_tasks:
+                    parent = db.execute(
+                        "SELECT parent_id FROM tasks WHERE id = ?",
+                        (parent_task,),
+                    ).fetchone()
+                    self._ensure_planned_entry(db, target_date, int(parent_task), 0, now)
+                    moving_tasks.add(int(parent_task))
+                    parent_task = parent["parent_id"] if parent else None
+
+            for item in selected:
+                self._relocate_entry(db, item, target_date, now)
+
+        return {
+            "moved_to": target_date,
+            "title": root["title"],
+            "source_date": source_date,
+        }
+
+    def _ensure_planned_entry(
+        self,
+        db: sqlite3.Connection,
+        plan_date: str,
+        task_id: int,
+        estimate: int,
+        now: str,
+    ) -> None:
+        existing = db.execute(
+            """
+            SELECT id, outcome, estimate_minutes
+            FROM plan_entries
+            WHERE plan_date = ? AND task_id = ?
+            """,
+            (plan_date, task_id),
+        ).fetchone()
+        if existing:
+            if existing["outcome"] == "completed":
+                raise AppError("这一天已经完成过这条任务")
+            if existing["outcome"] != "planned" or (
+                not int(existing["estimate_minutes"] or 0) and estimate
+            ):
+                db.execute(
+                    """
+                    UPDATE plan_entries
+                    SET outcome = 'planned',
+                        estimate_minutes = CASE
+                            WHEN estimate_minutes = 0 THEN ? ELSE estimate_minutes
+                        END,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (estimate, now, existing["id"]),
+                )
+            return
+        next_order = db.execute(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM plan_entries WHERE plan_date = ?",
+            (plan_date,),
+        ).fetchone()[0]
+        db.execute(
+            """
+            INSERT INTO plan_entries(
+                plan_date, task_id, estimate_minutes, sort_order,
+                outcome, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'planned', ?, ?)
+            """,
+            (plan_date, task_id, estimate, next_order, now, now),
+        )
+
+    def _relocate_entry(
+        self, db: sqlite3.Connection, item: dict, target_date: str, now: str
+    ) -> None:
+        entry_id = int(item["id"])
+        task_id = int(item["task_id"])
+        estimate = int(item["estimate_minutes"] or 0)
+        has_segments = db.execute(
+            "SELECT EXISTS(SELECT 1 FROM time_segments WHERE plan_entry_id = ?)",
+            (entry_id,),
+        ).fetchone()[0]
+        existing = db.execute(
+            """
+            SELECT id, outcome FROM plan_entries
+            WHERE plan_date = ? AND task_id = ? AND id <> ?
+            """,
+            (target_date, task_id, entry_id),
+        ).fetchone()
+        if existing and existing["outcome"] == "completed":
+            raise AppError("这一天已经完成过这条任务")
+        if existing:
+            self._ensure_planned_entry(db, target_date, task_id, estimate, now)
+            if has_segments:
+                db.execute(
+                    """
+                    UPDATE plan_entries
+                    SET outcome = 'rescheduled', estimate_minutes = 0,
+                        target_date = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (target_date, now, entry_id),
+                )
+            else:
+                db.execute("DELETE FROM plan_entries WHERE id = ?", (entry_id,))
+            return
+        if has_segments:
+            self._ensure_planned_entry(db, target_date, task_id, estimate, now)
+            db.execute(
+                """
+                UPDATE plan_entries
+                SET outcome = 'rescheduled', estimate_minutes = 0,
+                    target_date = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (target_date, now, entry_id),
+            )
+            return
+        next_order = db.execute(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM plan_entries WHERE plan_date = ?",
+            (target_date,),
+        ).fetchone()[0]
+        db.execute(
+            """
+            UPDATE plan_entries
+            SET plan_date = ?, sort_order = ?, outcome = 'planned',
+                estimate_minutes = ?, target_date = NULL,
+                unfinished_reason = NULL, reason_note = '', updated_at = ?
+            WHERE id = ?
+            """,
+            (target_date, next_order, estimate, now, entry_id),
+        )
+
     @staticmethod
     def _resolve_parent_entries(
         db: sqlite3.Connection, plan_date: str, now: str
@@ -1902,6 +2453,35 @@ class Database:
                 "carryovers": carryovers,
                 "review": review["content"] if review else "",
             }
+
+    def list_segments_between(self, start: str, end: str) -> list[dict]:
+        start_date = valid_date(start, "开始日期")
+        end_date = valid_date(end, "结束日期")
+        if end_date < start_date:
+            raise AppError("结束日期不能早于开始日期")
+        if (date.fromisoformat(end_date) - date.fromisoformat(start_date)).days > 31:
+            raise AppError("一次最多查看 31 天的时间记录")
+        now = utc_now()
+        with closing(self.connect()) as db, db:
+            self._expire_focus_timer(db, now)
+            return [
+                dict(row)
+                for row in db.execute(
+                    """
+                    SELECT ts.id, ts.start_at, ts.end_at, ts.duration_seconds,
+                           ts.mode, ts.focus_completed, pe.id AS entry_id,
+                           pe.plan_date, pe.estimate_minutes, pe.planned_start,
+                           t.title, COALESCE(p.name, '未分类') AS project_name
+                    FROM time_segments ts
+                    JOIN plan_entries pe ON pe.id = ts.plan_entry_id
+                    JOIN tasks t ON t.id = ts.task_id
+                    LEFT JOIN projects p ON p.id = t.project_id
+                    WHERE pe.plan_date BETWEEN ? AND ?
+                    ORDER BY ts.start_at, ts.id
+                    """,
+                    (start_date, end_date),
+                )
+            ]
 
     def get_report(self, anchor: str, period: str) -> dict:
         start_date, end_date = period_bounds(anchor, period)
@@ -2770,6 +3350,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             period = query.get("period", ["week"])[0]
             self._json(self.database.get_report(value, period))
             return
+        if method == "GET" and path == "/api/segments":
+            start = query.get("start", [date.today().isoformat()])[0]
+            end = query.get("end", [start])[0]
+            self._json(self.database.list_segments_between(start, end))
+            return
         if method == "GET" and path == "/api/memos":
             search = query.get("query", [""])[0]
             memo_date = query.get("date", [None])[0]
@@ -2785,6 +3370,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if method == "POST" and path == "/api/memos":
             self._json(self.database.create_memo(self._body()), HTTPStatus.CREATED)
+            return
+        if method == "GET" and path == "/api/memo-templates":
+            self._json(self.database.list_memo_templates())
+            return
+        if method == "POST" and path == "/api/memo-templates":
+            self._json(
+                self.database.create_memo_template(self._body()), HTTPStatus.CREATED
+            )
             return
         if method == "GET" and path == "/api/reminders":
             self._json(self.database.list_reminders())
@@ -2895,6 +3488,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         entry_prefix = "/api/entries/"
         if path.startswith(entry_prefix):
             suffix = path[len(entry_prefix) :].strip("/")
+            parts = suffix.split("/")
+            if (
+                len(parts) == 2
+                and parts[0].isdigit()
+                and parts[1] == "move"
+                and method == "POST"
+            ):
+                self._json(self.database.move_entry(int(parts[0]), self._body()))
+                return
             if "/" in suffix or not suffix.isdigit():
                 raise AppError("没有找到这个操作", HTTPStatus.NOT_FOUND)
             entry_id = int(suffix)
@@ -2931,6 +3533,21 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
             if method == "DELETE":
                 self.database.delete_reminder(reminder_id)
+                self._json({"deleted": True})
+                return
+        template_prefix = "/api/memo-templates/"
+        if path.startswith(template_prefix):
+            suffix = path[len(template_prefix) :].strip("/")
+            if "/" in suffix or not suffix.isdigit():
+                raise AppError("没有找到这个操作", HTTPStatus.NOT_FOUND)
+            template_id = int(suffix)
+            if method == "PATCH":
+                self._json(
+                    self.database.update_memo_template(template_id, self._body())
+                )
+                return
+            if method == "DELETE":
+                self.database.delete_memo_template(template_id)
                 self._json({"deleted": True})
                 return
         memo_prefix = "/api/memos/"

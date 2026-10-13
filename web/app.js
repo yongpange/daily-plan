@@ -29,6 +29,8 @@ const state = {
   dayDetailDate: "",
   dayDetail: null,
   dayDetailSequence: 0,
+  dayDetailWeek: "",
+  daySegments: [],
   reminders: [],
   editingReminderId: null,
   alertedReminderIds: new Set(),
@@ -41,6 +43,11 @@ const state = {
   editingEntry: null,
   editingSegment: null,
   editingMemo: null,
+  templates: [],
+  editingTemplateId: null,
+  templateTarget: null,
+  taskNoteEntryId: null,
+  moveEntryId: null,
   focusEntry: null,
   mood: null,
   closeMood: null,
@@ -184,6 +191,217 @@ function renderNote(value) {
   }
   html += escapeHtml(text.slice(lastIndex)).replaceAll("\n", "<br>");
   return html;
+}
+
+function looksLikeRichHtml(value) {
+  return /<\s*(p|br|strong|b|ul|ol|li|h3|div|span)\b/i.test(String(value || ""));
+}
+
+function sanitizeRichHtml(html) {
+  const template = document.createElement("template");
+  template.innerHTML = String(html || "");
+  const allowed = new Set(["P", "BR", "STRONG", "B", "UL", "OL", "LI", "H3", "DIV", "SPAN"]);
+  const clean = (node) => {
+    const fragment = document.createDocumentFragment();
+    [...node.childNodes].forEach((child) => {
+      if (child.nodeType === Node.TEXT_NODE) {
+        fragment.append(document.createTextNode(child.textContent));
+        return;
+      }
+      if (child.nodeType !== Node.ELEMENT_NODE) return;
+      let tag = child.tagName;
+      if (tag === "H1" || tag === "H2") tag = "H3";
+      if (tag === "DIV") tag = "P";
+      if (!allowed.has(tag) && tag !== "P" && tag !== "H3") {
+        fragment.append(clean(child));
+        return;
+      }
+      if (tag === "SPAN") {
+        fragment.append(clean(child));
+        return;
+      }
+      const element = document.createElement(tag.toLowerCase());
+      if (child.classList.contains("note-lg")) element.classList.add("note-lg");
+      if (child.classList.contains("note-title")) element.classList.add("note-title");
+      if (tag !== "BR") element.append(clean(child));
+      fragment.append(element);
+    });
+    return fragment;
+  };
+  const holder = document.createElement("div");
+  holder.append(clean(template.content));
+  return holder.innerHTML.trim();
+}
+
+function plainNoteText(content) {
+  const text = String(content || "");
+  if (!text) return "";
+  if (!looksLikeRichHtml(text)) return text.replace(/\s+/g, " ").trim();
+  const holder = document.createElement("div");
+  holder.innerHTML = sanitizeRichHtml(text);
+  return holder.innerText.replace(/\s+/g, " ").trim();
+}
+
+function renderMemoHtml(content) {
+  if (!content) return "";
+  if (!looksLikeRichHtml(content)) return renderNote(content);
+  return sanitizeRichHtml(content);
+}
+
+function richEditor(id) {
+  return document.getElementById(id);
+}
+
+function syncRichEmpty(editor) {
+  if (!editor) return;
+  const empty = !editor.innerText.replace(/\u00a0/g, " ").trim();
+  editor.classList.toggle("is-empty", empty);
+}
+
+function readRich(id) {
+  const editor = richEditor(id);
+  if (!editor || !editor.innerText.replace(/\u00a0/g, " ").trim()) return "";
+  return sanitizeRichHtml(editor.innerHTML);
+}
+
+function writeRich(id, content) {
+  const editor = richEditor(id);
+  if (!editor) return;
+  if (!content) {
+    editor.innerHTML = "";
+  } else if (looksLikeRichHtml(content)) {
+    editor.innerHTML = sanitizeRichHtml(content);
+  } else {
+    editor.innerHTML = String(content)
+      .split("\n")
+      .map((line) => `<p>${escapeHtml(line) || "<br>"}</p>`)
+      .join("");
+  }
+  syncRichEmpty(editor);
+}
+
+function clearRich(id) {
+  writeRich(id, "");
+}
+
+function richBlock(editor) {
+  const selection = window.getSelection();
+  if (!selection?.rangeCount) return null;
+  let node = selection.anchorNode;
+  if (!node || !editor.contains(node)) return null;
+  if (node.nodeType === Node.TEXT_NODE) node = node.parentNode;
+  while (node && node !== editor && !["P", "H3", "LI", "DIV"].includes(node.tagName)) {
+    node = node.parentNode;
+  }
+  return node && node !== editor ? node : null;
+}
+
+function applyRichCommand(editor, command) {
+  editor.focus();
+  if (command === "bold") {
+    document.execCommand("bold");
+  } else if (command === "list") {
+    document.execCommand("insertUnorderedList");
+  } else if (command === "title") {
+    document.execCommand("formatBlock", false, "h3");
+    richBlock(editor)?.classList.remove("note-lg");
+  } else if (command === "large" || command === "body") {
+    document.execCommand("formatBlock", false, "p");
+    const block = richBlock(editor);
+    if (!block) return;
+    block.classList.remove("note-lg", "note-title");
+    if (command === "large") block.classList.add("note-lg");
+  }
+  syncRichEmpty(editor);
+}
+
+function updateRichToolbar(wrap) {
+  const editor = wrap.querySelector(".rich-note-body");
+  const block = richBlock(editor);
+  wrap.querySelectorAll("[data-command]").forEach((button) => {
+    const command = button.dataset.command;
+    let active = false;
+    if (command === "bold") {
+      try {
+        active = document.queryCommandState("bold");
+      } catch {
+        active = false;
+      }
+    }
+    if (command === "list") {
+      try {
+        active = document.queryCommandState("insertUnorderedList");
+      } catch {
+        active = false;
+      }
+    }
+    if (command === "title") active = block?.tagName === "H3";
+    if (command === "large") active = Boolean(block?.classList.contains("note-lg"));
+    if (command === "body") {
+      active = Boolean(block && block.tagName !== "H3" && !block.classList.contains("note-lg"));
+    }
+    button.classList.toggle("is-active", active);
+  });
+}
+
+function markNoteSlots(root) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  nodes.forEach((node) => {
+    const parts = node.textContent.split(/(【[^】]{1,24}】)/);
+    if (parts.length === 1) return;
+    const fragment = document.createDocumentFragment();
+    parts.forEach((part) => {
+      if (/^【[^】]{1,24}】$/.test(part)) {
+        const slot = document.createElement("span");
+        slot.className = "note-slot";
+        slot.textContent = part;
+        fragment.append(slot);
+      } else if (part) {
+        fragment.append(document.createTextNode(part));
+      }
+    });
+    node.parentNode.replaceChild(fragment, node);
+  });
+}
+
+function insertTemplate(editor, content) {
+  const incoming = document.createElement("div");
+  incoming.innerHTML = looksLikeRichHtml(content)
+    ? sanitizeRichHtml(content)
+    : String(content || "")
+        .split("\n")
+        .map((line) => `<p>${escapeHtml(line) || "<br>"}</p>`)
+        .join("");
+  markNoteSlots(incoming);
+  const empty = !editor.innerText.replace(/\u00a0/g, " ").trim();
+  if (empty) editor.replaceChildren();
+  else {
+    const gap = document.createElement("p");
+    gap.append(document.createElement("br"));
+    editor.append(gap);
+  }
+  while (incoming.firstChild) editor.append(incoming.firstChild);
+  const slot = editor.querySelector(".note-slot");
+  editor.focus();
+  if (slot) {
+    const range = document.createRange();
+    range.selectNodeContents(slot);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+  syncRichEmpty(editor);
+}
+
+function memoSourceMarkup(memo) {
+  if (!memo.source_title) return "";
+  const estimate = Number(memo.source_estimate_minutes || 0)
+    ? `预估 ${formatMinutes(memo.source_estimate_minutes)}`
+    : "未设预估";
+  const actual = `实际 ${formatMinutes(Number(memo.source_actual_seconds || 0) / 60)}`;
+  return `<div class="memo-source"><span>来自任务</span><strong>${escapeHtml(memo.source_title)}</strong><em>${escapeHtml(`${estimate} · ${actual}`)}</em></div>`;
 }
 
 async function copyLink(url, button) {
@@ -397,14 +615,17 @@ function renderTasks() {
   const list = $("#taskList");
   const empty = $("#emptyTasks");
   const entries = state.day.entries || [];
-  empty.hidden = entries.length > 0;
-  list.hidden = entries.length === 0;
-  if (!entries.length) {
+  const visible = entries.filter(
+    (entry) => entry.outcome !== "carried" && entry.outcome !== "rescheduled",
+  );
+  empty.hidden = visible.length > 0;
+  list.hidden = visible.length === 0;
+  if (!visible.length) {
     list.innerHTML = "";
     return;
   }
 
-  list.innerHTML = entriesInTreeOrder(entries)
+  list.innerHTML = entriesInTreeOrder(visible)
     .map(({ entry, depth }) => {
       const completed = entry.outcome === "completed";
       const finished = entry.outcome !== "planned";
@@ -433,6 +654,13 @@ function renderTasks() {
       const containerHint = entry.has_children
         ? "<span>含子任务</span>"
         : `<span>预估 <strong>${formatMinutes(entry.estimate_minutes)}</strong></span>`;
+      const noteCount = (state.todayMemos || []).filter(
+        (memo) => Number(memo.source_entry_id) === Number(entry.id),
+      ).length;
+      const noteButton =
+        !entry.parent_id && completed
+          ? `<button class="task-action note" data-action="task-note" data-entry-id="${entry.id}">感悟${noteCount ? ` · ${noteCount}` : ""}</button>`
+          : "";
       return `
         <article class="task-row ${completed ? "is-completed" : ""} ${finished ? "is-finished" : ""}"
           data-entry-id="${entry.id}" data-depth="${depth}" style="--depth:${depth}">
@@ -451,6 +679,7 @@ function renderTasks() {
               <span class="${over ? "over-estimate" : ""}">
                 实际 <strong class="actual-time" data-entry-id="${entry.id}">${formatMinutes(actual / 60)}</strong>
               </span>
+              ${entry.outcome === "planned" ? '<span class="move-hint">右滑改期</span>' : ""}
               ${entry.definition?.trim() ? `<span class="note-hint">有说明</span>` : ""}
             </div>
             ${
@@ -472,6 +701,7 @@ function renderTasks() {
                      data-entry-id="${entry.id}">＋ 子任务</button>`
                 : ""
             }
+            ${noteButton}
             <button class="task-action task-more" data-action="edit"
               data-entry-id="${entry.id}" aria-label="编辑任务">···</button>
           </div>
@@ -488,7 +718,11 @@ function leafEntries(entries) {
 function renderSummary() {
   if (!state.day) return;
   const allEntries = state.day.entries || [];
-  const entries = leafEntries(allEntries);
+  const entries = leafEntries(
+    allEntries.filter(
+      (entry) => entry.outcome !== "carried" && entry.outcome !== "rescheduled",
+    ),
+  );
   const planned = entries.reduce(
     (sum, entry) => sum + Number(entry.estimate_minutes || 0),
     0,
@@ -645,7 +879,8 @@ function renderTodayMemos() {
         .map((image) => imageThumbMarkup(image, false))
         .join("");
       return `<div class="today-memo-item">
-        ${memo.content ? `<p>${escapeHtml(memo.content)}</p>` : ""}
+        ${memoSourceMarkup(memo)}
+        ${memo.content ? `<div class="memo-content">${renderMemoHtml(memo.content)}</div>` : ""}
         ${thumbs ? `<div class="image-strip">${thumbs}</div>` : ""}
       </div>`;
     })
@@ -1364,7 +1599,9 @@ async function saveTaskEdit(event) {
       }),
     });
     $("#editDialog").close();
+    closeSegmentPopover();
     await loadDay();
+    if (state.view === "report") await loadDayDetail();
     notify("任务已更新");
   } catch (error) {
     reportError(error);
@@ -1381,7 +1618,9 @@ async function deleteTask() {
   try {
     await api(`/api/entries/${state.editingEntry.id}`, { method: "DELETE" });
     $("#editDialog").close();
+    closeSegmentPopover();
     await loadDay();
+    if (state.view === "report") await loadDayDetail();
     notify("任务已删除");
   } catch (error) {
     reportError(error);
@@ -1657,7 +1896,7 @@ async function createMemo(payload, button) {
 async function submitQuickMemo(event) {
   event.preventDefault();
   const form = event.currentTarget;
-  const content = $("#quickMemoContent").value.trim();
+  const content = readRich("quickMemoContent");
   const tags = $("#quickMemoTags").value;
   if (!content && !state.pendingQuickImages.length && !state.quickMemoDraftId) {
     notify("先写下一句，或添加一张图片", true);
@@ -1670,6 +1909,7 @@ async function submitQuickMemo(event) {
       {
         date: state.date,
         content,
+        content_format: "rich",
         tags,
         has_images: state.pendingQuickImages.length > 0,
       },
@@ -1684,7 +1924,7 @@ async function submitQuickMemo(event) {
     if (retrying) {
       await api(`/api/memos/${memoId}`, {
         method: "PATCH",
-        body: JSON.stringify({ date: state.date, content, tags }),
+        body: JSON.stringify({ date: state.date, content, content_format: "rich", tags }),
       });
     }
   } catch (error) {
@@ -1694,6 +1934,7 @@ async function submitQuickMemo(event) {
   }
   state.quickMemoDraftId = null;
   form.reset();
+  clearRich("quickMemoContent");
   renderTagPresets();
   state.todayMemos = await api(
     `/api/memos?date=${encodeURIComponent(state.date)}&limit=30`,
@@ -1704,7 +1945,7 @@ async function submitQuickMemo(event) {
 
 async function submitMemoCompose(event) {
   event.preventDefault();
-  const content = $("#memoContent").value.trim();
+  const content = readRich("memoContent");
   const tags = $("#memoTags").value;
   if (!content && !state.pendingComposeImages.length && !state.composeMemoDraftId) {
     notify("先写下一句，或添加一张图片", true);
@@ -1717,6 +1958,7 @@ async function submitMemoCompose(event) {
       {
         date: $("#memoDate").value,
         content,
+        content_format: "rich",
         tags,
         has_images: state.pendingComposeImages.length > 0,
       },
@@ -1734,6 +1976,7 @@ async function submitMemoCompose(event) {
         body: JSON.stringify({
           date: $("#memoDate").value,
           content,
+          content_format: "rich",
           tags,
         }),
       });
@@ -1744,7 +1987,7 @@ async function submitMemoCompose(event) {
     return;
   }
   state.composeMemoDraftId = null;
-  $("#memoContent").value = "";
+  clearRich("memoContent");
   $("#memoTags").value = "";
   renderPendingImages();
   renderTagPresets();
@@ -1793,7 +2036,8 @@ function renderMemos(query = "") {
               }
             </div>
           </div>
-          ${memo.content ? `<p class="memo-content">${escapeHtml(memo.content)}</p>` : ""}
+          ${memoSourceMarkup(memo)}
+          ${memo.content ? `<div class="memo-content">${renderMemoHtml(memo.content)}</div>` : ""}
           ${
             (memo.images || []).length
               ? `<div class="image-strip">${memo.images.map((image) => imageThumbMarkup(image, false)).join("")}</div>`
@@ -1814,7 +2058,7 @@ function openMemoEdit(memoId) {
   const memo = state.memos.find((item) => Number(item.id) === Number(memoId));
   if (!memo || memo.kind !== "memo") return;
   state.editingMemo = memo;
-  $("#memoEditContent").value = memo.content;
+  writeRich("memoEditContent", memo.content);
   $("#memoEditDate").value = memo.memo_date;
   $("#memoEditTags").value = memo.tags || "";
   $("#memoEditPinned").checked = Boolean(memo.pinned);
@@ -1837,7 +2081,8 @@ async function saveMemoEdit(event) {
       method: "PATCH",
       body: JSON.stringify({
         date: $("#memoEditDate").value,
-        content: $("#memoEditContent").value,
+        content: readRich("memoEditContent"),
+        content_format: "rich",
         tags: $("#memoEditTags").value,
         pinned: $("#memoEditPinned").checked,
       }),
@@ -1853,7 +2098,7 @@ async function saveMemoEdit(event) {
 }
 
 function taskDraftFromNote(content) {
-  const text = String(content || "").replace(/\s+/g, " ").trim();
+  const text = plainNoteText(content);
   if (!text) return null;
   const title = text.length > 80 ? `${text.slice(0, 80).trim()}…` : text;
   const definition = text.length > 80 ? text.slice(0, 1000) : "";
@@ -2081,12 +2326,17 @@ async function loadDayDetail() {
   const date = state.dayDetailDate;
   const input = $("#dayDetailDate");
   if (input) input.value = date;
+  const range = weekBounds(date);
   const sequence = ++state.dayDetailSequence;
   try {
-    const data = await api(`/api/day?date=${encodeURIComponent(date)}`);
+    const segments = await api(
+      `/api/segments?start=${encodeURIComponent(range.start)}&end=${encodeURIComponent(range.end)}`,
+    );
     if (sequence !== state.dayDetailSequence || state.dayDetailDate !== date) return;
-    state.dayDetail = data;
-    renderDayDetail();
+    const weekChanged = state.dayDetailWeek !== range.start;
+    state.dayDetailWeek = range.start;
+    state.daySegments = segments;
+    renderDayDetail(weekChanged);
     $$("[data-chart-date]").forEach((column) => {
       column.classList.toggle("is-selected", column.dataset.chartDate === date);
     });
@@ -2095,40 +2345,230 @@ async function loadDayDetail() {
   }
 }
 
-function renderDayDetail() {
+function weekBounds(date) {
+  const parsed = parseLocalDate(date);
+  const mondayOffset = parsed.getDay() === 0 ? 6 : parsed.getDay() - 1;
+  const start = new Date(parsed);
+  start.setDate(parsed.getDate() - mondayOffset);
+  const end = new Date(start);
+  end.setDate(start.getDate() + 6);
+  return { start: localDateString(start), end: localDateString(end) };
+}
+
+function minutesFromMidnight(value) {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return 0;
+  return parsed.getHours() * 60 + parsed.getMinutes() + parsed.getSeconds() / 60;
+}
+
+function segmentBounds(segment) {
+  const start = Math.max(0, Math.min(24 * 60, minutesFromMidnight(segment.start_at)));
+  let end = segment.end_at
+    ? minutesFromMidnight(segment.end_at)
+    : start + Math.max(1, (Date.now() - new Date(segment.start_at).getTime()) / 60000);
+  if (end <= start) end = start + Math.max(1, Number(segment.duration_seconds || 60) / 60);
+  end = Math.max(start + 1, Math.min(24 * 60, end));
+  return { start, end };
+}
+
+function layoutDayBlocks(segments) {
+  const items = segments
+    .map((segment) => ({ segment, ...segmentBounds(segment) }))
+    .sort((left, right) => left.start - right.start || left.end - right.end);
+  const laneEnds = [];
+  items.forEach((item) => {
+    let lane = laneEnds.findIndex((end) => end <= item.start + 0.01);
+    if (lane < 0) {
+      lane = laneEnds.length;
+      laneEnds.push(item.end);
+    } else {
+      laneEnds[lane] = item.end;
+    }
+    item.lane = lane;
+  });
+  items.forEach((item) => {
+    const overlapping = items.filter(
+      (other) => other.start < item.end - 0.01 && other.end > item.start + 0.01,
+    );
+    item.lanes = Math.max(1, ...overlapping.map((other) => other.lane + 1));
+  });
+  return items;
+}
+
+function renderDayDetail(scrollIntoTime = false) {
+  closeSegmentPopover();
   const date = state.dayDetailDate;
   const heading = $("#dayDetailTitle");
   const summary = $("#dayDetailSummary");
-  const list = $("#dayDetailList");
-  if (!heading || !list) return;
+  const calendar = $("#dayCalendar");
+  if (!heading || !calendar) return;
   heading.textContent = dayDetailHeading(date);
-  const entries = (state.dayDetail?.entries || []).filter(
-    (entry) => entry.outcome === "completed" && !entry.has_children,
+  const selectedSegments = (state.daySegments || []).filter(
+    (segment) => segment.plan_date === date,
   );
-  if (!entries.length) {
-    summary.textContent = "这一天没有标记完成的任务";
-    list.innerHTML = "";
-    return;
-  }
-  const actualMinutes = entries.reduce(
-    (sum, entry) => sum + Number(entry.actual_seconds || 0) / 60,
-    0,
-  );
-  summary.textContent = `完成 ${entries.length} 项 · 实际 ${formatMinutes(actualMinutes)}`;
-  list.innerHTML = entries
-    .map((entry) => {
-      const note = String(entry.definition || "").trim();
-      const showNote = note && note !== entry.title;
-      return `
-        <article class="day-detail-item">
-          <div>
-            <strong>${escapeHtml(entry.title)}</strong>
-            <span>${escapeHtml(entry.project_name || "未分类")} · 预估 ${formatMinutes(entry.estimate_minutes)} · 实际 ${formatMinutes(Number(entry.actual_seconds || 0) / 60)}</span>
-            ${showNote ? `<p>${escapeHtml(note)}</p>` : ""}
+  const minutes = selectedSegments.reduce((sum, segment) => {
+    if (segment.end_at) return sum + Number(segment.duration_seconds || 0) / 60;
+    return sum + Math.max(0, (Date.now() - new Date(segment.start_at).getTime()) / 60000);
+  }, 0);
+  summary.textContent = selectedSegments.length
+    ? `这一天 ${selectedSegments.length} 段计时 · 实际 ${formatMinutes(minutes)}`
+    : "这一天还没有计时，空着的格子就是没记下的时间";
+
+  const range = weekBounds(date);
+  const today = localDateString(new Date());
+  const hourHeight = 48;
+  const hours = Array.from({ length: 24 }, (_, hour) => hour);
+  const weekDays = Array.from({ length: 7 }, (_, index) => shiftDate(range.start, index));
+  const weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+  calendar.innerHTML = `
+    <div class="cal-sheet">
+      <div class="cal-head">
+        <div class="cal-gutter-head"></div>
+        ${weekDays
+          .map((day, index) => {
+            const parsed = parseLocalDate(day);
+            return `<button type="button" class="cal-day ${day === date ? "is-selected" : ""} ${day === today ? "is-today" : ""}" data-cal-date="${day}">
+              <span>${weekday[index]}</span>
+              <strong>${parsed.getDate()}</strong>
+            </button>`;
+          })
+          .join("")}
+      </div>
+      <div class="cal-scroll" id="dayCalendarScroll">
+        <div class="cal-body">
+          <div class="cal-hours">
+            ${hours
+              .map(
+                (hour) =>
+                  `<div class="cal-hour-label">${String(hour).padStart(2, "0")}:00</div>`,
+              )
+              .join("")}
           </div>
-        </article>`;
-    })
-    .join("");
+          <div class="cal-columns">
+            ${
+              weekDays.includes(today)
+                ? `<div class="cal-now" style="top:${((new Date().getHours() * 60 + new Date().getMinutes()) / 60) * hourHeight}px"><i></i><span>${String(new Date().getHours()).padStart(2, "0")}:${String(new Date().getMinutes()).padStart(2, "0")}</span></div>`
+                : ""
+            }
+            ${weekDays
+              .map((day) => {
+                const blocks = layoutDayBlocks(
+                  (state.daySegments || []).filter((segment) => segment.plan_date === day),
+                );
+                return `<div class="cal-col ${day === date ? "is-selected" : ""} ${indexWeekend(day) ? "is-weekend" : ""}">
+                  ${hours.map(() => '<div class="cal-hour-slot"></div>').join("")}
+                  ${blocks
+                    .map((item) => {
+                      const top = (item.start / 60) * hourHeight;
+                      const height = Math.max(22, ((item.end - item.start) / 60) * hourHeight - 2);
+                      const width = 100 / item.lanes;
+                      const left = item.lane * width;
+                      const clock = `${formatShortClock(item.segment.start_at)}–${formatShortClock(item.segment.end_at)}`;
+                      const focus = item.segment.mode === "focus";
+                      return `<button type="button" class="cal-block ${focus ? "is-focus" : ""}" data-segment-id="${item.segment.id}" style="top:${top}px;height:${height}px;left:calc(${left}% + 2px);width:calc(${width}% - 4px)" title="${escapeHtml(item.segment.title)} ${clock}">
+                        <strong>${escapeHtml(item.segment.title)}</strong>
+                        ${height >= 38 ? `<span>${escapeHtml(clock)}</span>` : ""}
+                      </button>`;
+                    })
+                    .join("")}
+                </div>`;
+              })
+              .join("")}
+          </div>
+        </div>
+      </div>
+    </div>`;
+  if (scrollIntoTime) {
+    const scroller = $("#dayCalendarScroll");
+    const earliest = (state.daySegments || []).map(segmentBounds).sort((a, b) => a.start - b.start)[0];
+    const hour = earliest ? Math.max(0, Math.floor(earliest.start / 60) - 1) : 8;
+    scroller.scrollTop = hour * hourHeight;
+  }
+}
+
+function indexWeekend(date) {
+  const day = parseLocalDate(date).getDay();
+  return day === 0 || day === 6;
+}
+
+function formatSegmentMoment(value) {
+  if (!value) return "进行中";
+  const day = new Intl.DateTimeFormat("zh-CN", {
+    month: "long",
+    day: "numeric",
+  }).format(new Date(value));
+  return `${day} ${formatShortClock(value)}`;
+}
+
+function formatSegmentRange(segment) {
+  const date = new Date(segment.start_at);
+  const weekday = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"][date.getDay()];
+  return `${date.getMonth() + 1}月${date.getDate()}日 (${weekday}) ${formatShortClock(segment.start_at)} - ${formatShortClock(segment.end_at)}`;
+}
+
+function estimatedFinishText(segment) {
+  const minutes = Number(segment.estimate_minutes || 0);
+  if (!minutes) return "未设置";
+  let start = new Date(segment.start_at);
+  if (segment.planned_start) {
+    const planned = new Date(
+      `${segment.plan_date}T${String(segment.planned_start).slice(0, 5)}:00`,
+    );
+    if (!Number.isNaN(planned.getTime())) start = planned;
+  }
+  const finish = new Date(start.getTime() + minutes * 60000);
+  return formatSegmentMoment(finish.toISOString());
+}
+
+function closeSegmentPopover() {
+  state.popoverSegment = null;
+  const popover = $("#segmentPopover");
+  if (popover) popover.hidden = true;
+  $$(".cal-block.is-open").forEach((block) => block.classList.remove("is-open"));
+}
+
+function openSegmentPopover(segment, anchor) {
+  state.popoverSegment = segment;
+  $$(".cal-block").forEach((block) => {
+    block.classList.toggle("is-open", Number(block.dataset.segmentId) === Number(segment.id));
+  });
+  $("#segmentPopoverTitle").textContent = segment.title;
+  $("#segmentPopoverWhen").textContent = formatSegmentRange(segment);
+  $("#segmentPopoverEstimate").textContent = `预计完成时间　${estimatedFinishText(segment)}`;
+  $("#segmentPopoverActual").textContent = `实际完成时间　${
+    segment.end_at ? formatSegmentMoment(segment.end_at) : "进行中"
+  }`;
+  const popover = $("#segmentPopover");
+  popover.hidden = false;
+  const rect = anchor.getBoundingClientRect();
+  const width = popover.offsetWidth;
+  const height = popover.offsetHeight;
+  let left = rect.right + 8;
+  let top = rect.top;
+  if (left + width > window.innerWidth - 8) left = rect.left - width - 8;
+  if (top + height > window.innerHeight - 8) top = window.innerHeight - height - 8;
+  popover.style.left = `${Math.max(8, left)}px`;
+  popover.style.top = `${Math.max(8, top)}px`;
+}
+
+async function editPopoverTask() {
+  const segment = state.popoverSegment;
+  if (!segment) return;
+  try {
+    const data = await api(`/api/day?date=${encodeURIComponent(segment.plan_date)}`);
+    const entry = (data.entries || []).find((item) => item.id === segment.entry_id);
+    if (!entry) {
+      notify("没有找到这条任务", true);
+      return;
+    }
+    const previousDay = state.day;
+    state.day = data;
+    openEditDialog(entry.id);
+    if (state.view !== "today") state.day = previousDay;
+    closeSegmentPopover();
+  } catch (error) {
+    reportError(error);
+  }
 }
 
 function renderReportChart() {
@@ -2911,7 +3351,384 @@ async function acknowledgeOpenReminders() {
   }
 }
 
+function taskTreeEstimate(entry) {
+  const children = (state.day?.entries || []).filter(
+    (candidate) => candidate.parent_id === entry.task_id,
+  );
+  if (!children.length) return Number(entry.estimate_minutes || 0);
+  return children.reduce((sum, child) => sum + taskTreeEstimate(child), 0);
+}
+
+function openTaskNote(entry) {
+  state.taskNoteEntryId = entry.id;
+  $("#taskNoteTitle").textContent = entry.title;
+  const estimate = taskTreeEstimate(entry);
+  const actual = aggregateSeconds(entry);
+  const estimateText = estimate ? `预估 ${formatMinutes(estimate)}` : "未设预估";
+  $("#taskNoteMeta").textContent = `${formatMemoDate(state.date)} · ${estimateText} · 实际 ${formatMinutes(actual / 60)}`;
+  clearRich("taskNoteContent");
+  $("#taskNoteTags").value = "";
+  renderTagPresets();
+  $("#taskNoteDialog").showModal();
+}
+
+async function submitTaskNote(event) {
+  event.preventDefault();
+  const content = readRich("taskNoteContent");
+  if (!content) {
+    notify("先写下一点感悟", true);
+    return;
+  }
+  const button = event.submitter;
+  const memo = await createMemo(
+    {
+      date: state.date,
+      content,
+      content_format: "rich",
+      tags: $("#taskNoteTags").value,
+      entry_id: state.taskNoteEntryId,
+    },
+    button,
+  );
+  if (!memo) return;
+  $("#taskNoteDialog").close();
+  clearRich("taskNoteContent");
+  await loadDay();
+  await loadMemos();
+}
+
+function renderTemplates() {
+  const list = $("#templateList");
+  if (!state.templates.length) {
+    list.innerHTML = "";
+    return;
+  }
+  list.innerHTML = state.templates
+    .map(
+      (template) => `
+        <div class="template-row">
+          <strong>${escapeHtml(template.name)}</strong>
+          <div>
+            <button type="button" data-template-action="use" data-template-id="${template.id}">使用</button>
+            <button type="button" data-template-action="edit" data-template-id="${template.id}">编辑</button>
+            <button type="button" data-template-action="delete" data-template-id="${template.id}">删除</button>
+          </div>
+        </div>`,
+    )
+    .join("");
+}
+
+async function loadTemplates() {
+  state.templates = await api("/api/memo-templates");
+  renderTemplates();
+}
+
+function resetTemplateForm() {
+  state.editingTemplateId = null;
+  $("#templateName").value = "";
+  clearRich("templateContent");
+  $("#saveTemplate").textContent = "保存模板";
+}
+
+async function openTemplateDialog(editor) {
+  state.templateTarget = editor || richEditor("memoContent");
+  resetTemplateForm();
+  try {
+    await loadTemplates();
+  } catch (error) {
+    reportError(error);
+    return;
+  }
+  $("#templateDialog").showModal();
+}
+
+async function saveTemplate(event) {
+  event.preventDefault();
+  const name = $("#templateName").value.trim();
+  const content = readRich("templateContent");
+  if (!name) {
+    notify("先给模板起个名字", true);
+    return;
+  }
+  if (!content) {
+    notify("模板里先写一点内容", true);
+    return;
+  }
+  const button = $("#saveTemplate");
+  setBusy(button, true, "保存中…");
+  try {
+    if (state.editingTemplateId) {
+      await api(`/api/memo-templates/${state.editingTemplateId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name, content, content_format: "rich" }),
+      });
+    } else {
+      await api("/api/memo-templates", {
+        method: "POST",
+        body: JSON.stringify({ name, content, content_format: "rich" }),
+      });
+    }
+    resetTemplateForm();
+    await loadTemplates();
+    notify("模板已保存");
+  } catch (error) {
+    reportError(error);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function deleteTemplate(templateId, button) {
+  if (!window.confirm("确定删除这个模板吗？")) return;
+  setBusy(button, true, "删除中…");
+  try {
+    await api(`/api/memo-templates/${templateId}`, { method: "DELETE" });
+    if (state.editingTemplateId === templateId) resetTemplateForm();
+    await loadTemplates();
+  } catch (error) {
+    reportError(error);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+function formatMonthDay(value) {
+  const date = parseLocalDate(value);
+  return `${date.getMonth() + 1}月${date.getDate()}日`;
+}
+
+function nextMonday(fromDate) {
+  const date = parseLocalDate(fromDate);
+  const day = date.getDay();
+  const delta = day === 1 ? 7 : (8 - day) % 7;
+  return shiftDate(fromDate, delta || 7);
+}
+
+function moveChoices(entry) {
+  const today = localDateString(new Date());
+  const earliest = entry.plan_date < today ? today : shiftDate(entry.plan_date, 1);
+  const choices = [];
+  const push = (key, date, label) => {
+    if (date < earliest || choices.some((item) => item.date === date)) return;
+    choices.push({ key, date, label });
+  };
+  if (entry.plan_date < today) push("today", today, "今天");
+  push("tomorrow", shiftDate(today, 1), "明天");
+  push("day-after", shiftDate(today, 2), "后天");
+  push("monday", nextMonday(today), "下周一");
+  return { earliest, choices };
+}
+
+function closeMovePopover() {
+  state.moveEntryId = null;
+  const popover = $("#moveTaskPopover");
+  if (popover) popover.hidden = true;
+  $$(".task-row.is-move-open").forEach((row) => row.classList.remove("is-move-open"));
+}
+
+function openMovePopover(entryId, row) {
+  const entry = state.day?.entries?.find((item) => item.id === entryId);
+  if (!entry || entry.outcome !== "planned") return;
+  state.moveEntryId = entryId;
+  const { earliest, choices } = moveChoices(entry);
+  $("#moveTaskTitle").textContent = entry.title;
+  $("#moveTaskChoices").innerHTML = choices
+    .map(
+      (choice) =>
+        `<button type="button" class="${choice.key === "tomorrow" ? "is-primary" : ""}" data-move-date="${choice.date}">${choice.label} · ${formatMonthDay(choice.date)}</button>`,
+    )
+    .join("");
+  const input = $("#moveTaskDate");
+  input.min = earliest;
+  input.value = choices.find((choice) => choice.key === "tomorrow")?.date || earliest;
+  const logged = aggregateSeconds(entry) > 0;
+  $("#moveTaskNote").textContent = logged
+    ? "任务会从这一天剪走。已经记下的工作时间仍留在原来的工作日志里。"
+    : "任务会从这一天剪走，只出现在选中的那一天。";
+  $$(".task-row.is-move-open").forEach((item) => item.classList.remove("is-move-open"));
+  row.classList.add("is-move-open");
+  const popover = $("#moveTaskPopover");
+  popover.hidden = false;
+  const rect = row.getBoundingClientRect();
+  const width = popover.offsetWidth;
+  const height = popover.offsetHeight;
+  let left = rect.right - width - 12;
+  let top = rect.bottom + 6;
+  if (left < 8) left = Math.min(rect.left, window.innerWidth - width - 8);
+  if (top + height > window.innerHeight - 8) top = Math.max(8, rect.top - height - 6);
+  popover.style.left = `${Math.max(8, left)}px`;
+  popover.style.top = `${Math.max(8, top)}px`;
+}
+
+async function moveTaskTo(targetDate) {
+  const entryId = state.moveEntryId;
+  if (!entryId || !targetDate) return;
+  const entry = state.day?.entries?.find((item) => item.id === entryId);
+  try {
+    const result = await api(`/api/entries/${entryId}/move`, {
+      method: "POST",
+      body: JSON.stringify({ date: targetDate }),
+    });
+    closeMovePopover();
+    await loadDay();
+    notify(`「${entry?.title || result.title}」已移到 ${formatMonthDay(result.moved_to)}`);
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+function bindTaskMove() {
+  const list = $("#taskList");
+  if (!list) return;
+  let drag = null;
+  let ignoreNextClick = false;
+  const resetDrag = () => {
+    if (!drag) return;
+    drag.row.style.transform = "";
+    drag.row.classList.remove("is-dragging", "is-move-ready");
+    drag = null;
+  };
+  list.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    if (event.target.closest("button, a, input, textarea, .task-note")) return;
+    const row = event.target.closest(".task-row");
+    if (!row) return;
+    const entry = state.day?.entries?.find((item) => item.id === Number(row.dataset.entryId));
+    if (!entry || entry.outcome !== "planned") return;
+    drag = {
+      pointerId: event.pointerId,
+      row,
+      entryId: entry.id,
+      startX: event.clientX,
+      startY: event.clientY,
+      active: false,
+    };
+    row.setPointerCapture?.(event.pointerId);
+  });
+  list.addEventListener("pointermove", (event) => {
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    const dx = event.clientX - drag.startX;
+    const dy = event.clientY - drag.startY;
+    if (!drag.active) {
+      if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+      if (Math.abs(dy) > Math.abs(dx)) {
+        resetDrag();
+        return;
+      }
+      drag.active = true;
+      drag.row.classList.add("is-dragging");
+    }
+    const shift = Math.max(0, Math.min(dx * 0.28, 28));
+    drag.row.style.transform = shift ? `translateX(${shift}px)` : "";
+    drag.row.classList.toggle("is-move-ready", dx >= 64);
+  });
+  const finishDrag = (event) => {
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    const dx = event.clientX - drag.startX;
+    const ready = drag.active && dx >= 64;
+    const row = drag.row;
+    const entryId = drag.entryId;
+    resetDrag();
+    if (!ready) return;
+    ignoreNextClick = true;
+    openMovePopover(entryId, row);
+  };
+  list.addEventListener("pointerup", finishDrag);
+  list.addEventListener("pointercancel", (event) => {
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    resetDrag();
+  });
+  $("#moveTaskChoices").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-move-date]");
+    if (!button) return;
+    moveTaskTo(button.dataset.moveDate);
+  });
+  $("#moveTaskDate").addEventListener("change", (event) => {
+    if (!event.target.value) return;
+    moveTaskTo(event.target.value);
+  });
+  document.addEventListener("click", (event) => {
+    if (ignoreNextClick) {
+      ignoreNextClick = false;
+      return;
+    }
+    const popover = $("#moveTaskPopover");
+    if (!popover || popover.hidden) return;
+    if (popover.contains(event.target) || event.target.closest(".task-row.is-move-open")) return;
+    closeMovePopover();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeMovePopover();
+  });
+}
+
+function initRichNotes() {
+  try {
+    document.execCommand("defaultParagraphSeparator", false, "p");
+  } catch {
+    // 个别浏览器不支持默认段落，回车仍然可以换行。
+  }
+  const imageHandlers = {
+    quickMemoContent: (files) => addFilesToBucket(files, "quick"),
+    memoContent: (files) => addFilesToBucket(files, "compose"),
+    memoEditContent: (files) => addMemoEditImages(files),
+  };
+  $$(".rich-note").forEach((wrap) => {
+    const editor = wrap.querySelector(".rich-note-body");
+    const toolbar = wrap.querySelector(".rich-note-toolbar");
+    syncRichEmpty(editor);
+    editor.addEventListener("input", () => syncRichEmpty(editor));
+    editor.addEventListener("keyup", () => updateRichToolbar(wrap));
+    editor.addEventListener("mouseup", () => updateRichToolbar(wrap));
+    editor.addEventListener("click", (event) => {
+      const slot = event.target.closest(".note-slot");
+      if (!slot || !editor.contains(slot)) return;
+      const range = document.createRange();
+      range.selectNodeContents(slot);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+    });
+    editor.addEventListener("paste", async (event) => {
+      const files = [...event.clipboardData.items]
+        .filter((item) => item.type.startsWith("image/"))
+        .map((item) => item.getAsFile())
+        .filter(Boolean);
+      const handler = imageHandlers[editor.id];
+      if (files.length && handler) {
+        event.preventDefault();
+        try {
+          await handler(files);
+        } catch (error) {
+          reportError(error);
+        }
+        return;
+      }
+      const text = event.clipboardData.getData("text/plain");
+      if (!text) return;
+      event.preventDefault();
+      document.execCommand("insertText", false, text);
+      syncRichEmpty(editor);
+    });
+    toolbar?.addEventListener("mousedown", (event) => {
+      if (event.target.closest("button")) event.preventDefault();
+    });
+    toolbar?.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-command]");
+      if (!button) return;
+      if (button.dataset.command === "template") {
+        openTemplateDialog(editor);
+        return;
+      }
+      applyRichCommand(editor, button.dataset.command);
+      updateRichToolbar(wrap);
+    });
+  });
+}
+
 function bindEvents() {
+  initRichNotes();
+  bindTaskMove();
   $$(".nav-button").forEach((button) => {
     button.addEventListener("click", () => switchView(button.dataset.view));
   });
@@ -2978,6 +3795,7 @@ function bindEvents() {
       toggleComplete(entryId, button);
     }
     if (button.dataset.action === "edit") openEditDialog(entryId);
+    if (button.dataset.action === "task-note" && entry) openTaskNote(entry);
     if (button.dataset.action === "subtask" && entry) {
       showAddTask(entry);
       $("#addTaskForm").scrollIntoView({ behavior: "smooth", block: "center" });
@@ -3053,9 +3871,6 @@ function bindEvents() {
     addFilesToBucket(files, "compose"),
   );
   bindImageDrop($("#memoDialog"), (files) => addMemoEditImages(files));
-  bindImagePaste($("#quickMemoContent"), (files) => addFilesToBucket(files, "quick"));
-  bindImagePaste($("#memoContent"), (files) => addFilesToBucket(files, "compose"));
-  bindImagePaste($("#memoEditContent"), (files) => addMemoEditImages(files));
   document.addEventListener("click", async (event) => {
     const view = event.target.closest("[data-action='view-image']");
     if (view) {
@@ -3164,6 +3979,32 @@ function bindEvents() {
   });
   $("#memoEditForm").addEventListener("submit", saveMemoEdit);
   $("#deleteMemo").addEventListener("click", deleteMemo);
+  $("#taskNoteForm").addEventListener("submit", submitTaskNote);
+  $("#closeTaskNote").addEventListener("click", () => $("#taskNoteDialog").close());
+  $("#cancelTaskNote").addEventListener("click", () => $("#taskNoteDialog").close());
+  $("#openMemoTemplates").addEventListener("click", () => openTemplateDialog(richEditor("memoContent")));
+  $("#templateForm").addEventListener("submit", saveTemplate);
+  $("#closeTemplateDialog").addEventListener("click", () => $("#templateDialog").close());
+  $("#resetTemplateForm").addEventListener("click", resetTemplateForm);
+  $("#templateList").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-template-action]");
+    if (!button) return;
+    const template = state.templates.find(
+      (item) => Number(item.id) === Number(button.dataset.templateId),
+    );
+    if (!template) return;
+    if (button.dataset.templateAction === "use") {
+      insertTemplate(state.templateTarget || richEditor("memoContent"), template.content);
+      $("#templateDialog").close();
+    }
+    if (button.dataset.templateAction === "edit") {
+      state.editingTemplateId = template.id;
+      $("#templateName").value = template.name;
+      writeRich("templateContent", template.content);
+      $("#saveTemplate").textContent = "更新模板";
+    }
+    if (button.dataset.templateAction === "delete") deleteTemplate(template.id, button);
+  });
   $("#saveWeekReview").addEventListener("click", saveReportReview);
   $("#weekChart").addEventListener("click", (event) => {
     const column = event.target.closest("[data-chart-date]");
@@ -3190,6 +4031,28 @@ function bindEvents() {
   $("#dayDetailYesterday").addEventListener("click", () => {
     state.dayDetailDate = shiftDate(localDateString(new Date()), -1);
     loadDayDetail();
+  });
+  $("#dayCalendar").addEventListener("click", (event) => {
+    const block = event.target.closest("[data-segment-id]");
+    if (block) {
+      const segment = (state.daySegments || []).find(
+        (item) => String(item.id) === block.dataset.segmentId,
+      );
+      if (segment) openSegmentPopover(segment, block);
+      return;
+    }
+    const day = event.target.closest("[data-cal-date]");
+    if (!day || day.dataset.calDate === state.dayDetailDate) return;
+    state.dayDetailDate = day.dataset.calDate;
+    loadDayDetail();
+  });
+  $("#closeSegmentPopover").addEventListener("click", closeSegmentPopover);
+  $("#editSegmentTask").addEventListener("click", editPopoverTask);
+  document.addEventListener("click", (event) => {
+    const popover = $("#segmentPopover");
+    if (!popover || popover.hidden) return;
+    if (popover.contains(event.target) || event.target.closest(".cal-block")) return;
+    closeSegmentPopover();
   });
 
   $("#routineTodayList").addEventListener("click", (event) => {
