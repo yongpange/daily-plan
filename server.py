@@ -432,6 +432,28 @@ class Database:
                 CREATE INDEX IF NOT EXISTS reminders_by_time
                 ON reminders(status, remind_at);
 
+                CREATE TABLE IF NOT EXISTS memo_reads (
+                    owner_kind TEXT NOT NULL
+                        CHECK (owner_kind IN ('memo', 'daily')),
+                    owner_key TEXT NOT NULL,
+                    read_count INTEGER NOT NULL DEFAULT 0
+                        CHECK (read_count >= 0),
+                    last_read_at TEXT NOT NULL,
+                    PRIMARY KEY (owner_kind, owner_key)
+                );
+
+                CREATE TABLE IF NOT EXISTS threads (
+                    id INTEGER PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    done_when TEXT NOT NULL,
+                    project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+                    status TEXT NOT NULL DEFAULT 'active'
+                        CHECK (status IN ('active', 'paused', 'done')),
+                    featured INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS app_settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
@@ -460,6 +482,21 @@ class Database:
                     PRIMARY KEY (routine_id, plan_date)
                 );
 
+                CREATE TABLE IF NOT EXISTS routine_segments (
+                    id INTEGER PRIMARY KEY,
+                    routine_id INTEGER NOT NULL
+                        REFERENCES routines(id) ON DELETE CASCADE,
+                    plan_date TEXT NOT NULL,
+                    start_at TEXT NOT NULL,
+                    end_at TEXT,
+                    duration_seconds INTEGER
+                        CHECK (duration_seconds IS NULL OR duration_seconds >= 0),
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS routine_segments_by_day
+                ON routine_segments(plan_date, routine_id);
+
                 CREATE TABLE IF NOT EXISTS routine_challenges (
                     id TEXT PRIMARY KEY,
                     questions_json TEXT NOT NULL,
@@ -484,6 +521,20 @@ class Database:
             self._ensure_column(db, "memos", "source_estimate_minutes", "INTEGER")
             self._ensure_column(db, "memos", "source_actual_seconds", "INTEGER")
             self._ensure_column(db, "memos", "source_plan_date", "TEXT")
+            self._ensure_column(db, "memos", "source_kind", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(db, "memos", "source_routine_id", "INTEGER")
+            self._ensure_column(db, "memos", "source_thread_id", "INTEGER")
+            self._ensure_column(db, "memos", "source_task_id", "INTEGER")
+            self._ensure_column(db, "memos", "note_title", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(db, "memos", "note_link", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(db, "plan_entries", "thread_id", "INTEGER")
+            db.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS one_thread_step_per_day
+                ON plan_entries(plan_date, thread_id)
+                WHERE thread_id IS NOT NULL
+                """
+            )
             self._ensure_image_ids(db)
             self._merge_daily_notes(db)
 
@@ -647,6 +698,26 @@ class Database:
         )
         return running
 
+    def _close_running_routine(self, db: sqlite3.Connection, now: str) -> sqlite3.Row | None:
+        running = db.execute(
+            """
+            SELECT id, routine_id, plan_date, start_at
+            FROM routine_segments
+            WHERE end_at IS NULL
+            """
+        ).fetchone()
+        if not running:
+            return None
+        db.execute(
+            """
+            UPDATE routine_segments
+            SET end_at = ?, duration_seconds = ?
+            WHERE id = ?
+            """,
+            (now, seconds_between(running["start_at"], now), running["id"]),
+        )
+        return running
+
     @staticmethod
     def _expire_focus_timer(
         db: sqlite3.Connection, now: str
@@ -684,10 +755,11 @@ class Database:
             SELECT
                 pe.id, pe.plan_date, pe.estimate_minutes, pe.planned_start,
                 pe.sort_order, pe.outcome, pe.unfinished_reason,
-                pe.reason_note, pe.target_date,
+                pe.reason_note, pe.target_date, pe.thread_id,
                 t.id AS task_id, t.title, t.parent_id, t.definition,
                 t.status AS task_status,
                 p.name AS project_name,
+                th.title AS thread_title,
                 COALESCE((
                     SELECT SUM(
                         CASE
@@ -715,6 +787,7 @@ class Database:
             FROM plan_entries pe
             JOIN tasks t ON t.id = pe.task_id
             LEFT JOIN projects p ON p.id = t.project_id
+            LEFT JOIN threads th ON th.id = pe.thread_id
             WHERE pe.id = ?
             """,
             (now, entry_id),
@@ -769,6 +842,52 @@ class Database:
                     (clean_date,),
                 )
             ]
+            routine_running = db.execute(
+                """
+                SELECT rs.id, rs.routine_id, rs.plan_date, rs.start_at, r.title
+                FROM routine_segments rs
+                JOIN routines r ON r.id = rs.routine_id
+                WHERE rs.end_at IS NULL
+                """
+            ).fetchone()
+            if running is None and routine_running is not None:
+                running = {
+                    "id": routine_running["id"],
+                    "plan_entry_id": None,
+                    "routine_id": int(routine_running["routine_id"]),
+                    "start_at": routine_running["start_at"],
+                    "mode": "open",
+                    "target_seconds": None,
+                    "plan_date": routine_running["plan_date"],
+                    "title": routine_running["title"],
+                }
+            for row in db.execute(
+                """
+                SELECT rs.id, rs.routine_id, rs.start_at, rs.end_at,
+                       rs.duration_seconds, r.title
+                FROM routine_segments rs
+                JOIN routines r ON r.id = rs.routine_id
+                WHERE rs.plan_date = ?
+                ORDER BY rs.start_at DESC, rs.id DESC
+                """,
+                (clean_date,),
+            ):
+                segments.append(
+                    {
+                        "id": int(row["id"]),
+                        "plan_entry_id": None,
+                        "routine_id": int(row["routine_id"]),
+                        "start_at": row["start_at"],
+                        "end_at": row["end_at"],
+                        "duration_seconds": row["duration_seconds"],
+                        "mode": "open",
+                        "target_seconds": None,
+                        "focus_completed": 0,
+                        "title": row["title"],
+                        "project_name": "每日必做",
+                        "kind": "routine",
+                    }
+                )
             day_record = (
                 dict(day)
                 if day
@@ -790,6 +909,7 @@ class Database:
                 "segments": segments,
                 "reasons": REASONS,
                 "routines": self._routines_on(db, clean_date),
+                "threads": self._threads_for_day(db, clean_date),
             }
 
     def create_entry(self, payload: dict) -> dict:
@@ -996,6 +1116,7 @@ class Database:
                     "stopped_entry_id": None,
                     "already_running": True,
                 }
+            stopped_routine = self._close_running_routine(db, now)
             stopped = self._close_running(db, now)
             db.execute(
                 """
@@ -1018,6 +1139,9 @@ class Database:
                 "stopped_entry_id": int(stopped["plan_entry_id"])
                 if stopped
                 else None,
+                "stopped_routine_id": int(stopped_routine["routine_id"])
+                if stopped_routine
+                else None,
                 "already_running": False,
                 "mode": mode,
                 "target_seconds": target_seconds,
@@ -1034,7 +1158,25 @@ class Database:
                 "WHERE end_at IS NULL"
             ).fetchone()
             if not running:
-                return {"stopped": False, "entry_id": None}
+                routine_open = db.execute(
+                    """
+                    SELECT id FROM routine_segments
+                    WHERE end_at IS NULL
+                    """
+                ).fetchone()
+                if not routine_open:
+                    return {"stopped": False, "entry_id": None}
+                if entry_id is not None:
+                    raise AppError("当前计时属于另一条任务")
+                routine = self._close_running_routine(db, now)
+                return {
+                    "stopped": True,
+                    "entry_id": None,
+                    "routine_id": int(routine["routine_id"]),
+                    "duration_seconds": seconds_between(routine["start_at"], now),
+                    "mode": "open",
+                    "focus_completed": False,
+                }
             if entry_id is not None and int(running["plan_entry_id"]) != entry_id:
                 raise AppError("当前计时属于另一条任务")
             duration = seconds_between(running["start_at"], now)
@@ -1122,21 +1264,63 @@ class Database:
             db.execute("DELETE FROM time_segments WHERE id = ?", (segment_id,))
 
     def list_memos(
-        self, query: str = "", memo_date: str | None = None, limit: int = 100
+        self,
+        query: str = "",
+        memo_date: str | None = None,
+        limit: int = 100,
+        source_kind: str = "",
+        source_id: int | None = None,
+        task_id: int | None = None,
     ) -> list[dict]:
         clean_query = query.strip()[:200]
         if memo_date:
             memo_date = valid_date(memo_date)
         limit = max(1, min(int(limit), 300))
+        source_kind = str(source_kind or "").strip()
+        if source_kind and source_kind not in {"routine", "thread"}:
+            raise AppError("感悟来源不正确")
         clauses = []
         params: list[object] = []
         if clean_query:
-            clauses.append("(content LIKE ? OR tags LIKE ? OR source_title LIKE ?)")
+            clauses.append(
+                "(content LIKE ? OR tags LIKE ? OR source_title LIKE ? OR note_title LIKE ?)"
+            )
             wildcard = f"%{clean_query}%"
-            params.extend([wildcard, wildcard, wildcard])
+            params.extend([wildcard, wildcard, wildcard, wildcard])
         if memo_date:
             clauses.append("memo_date = ?")
             params.append(memo_date)
+        if source_kind == "routine":
+            if source_id is None:
+                raise AppError("感悟来源不正确")
+            clauses.append("source_routine_id = ?")
+            params.append(int(source_id))
+        elif source_kind == "thread":
+            if source_id is None:
+                raise AppError("感悟来源不正确")
+            clauses.append(
+                """
+                (
+                    source_thread_id = ?
+                    OR source_entry_id IN (
+                        SELECT id FROM plan_entries WHERE thread_id = ?
+                    )
+                )
+                """
+            )
+            params.extend([int(source_id), int(source_id)])
+        if task_id is not None:
+            clauses.append(
+                """
+                (
+                    source_task_id = ?
+                    OR source_entry_id IN (
+                        SELECT id FROM plan_entries WHERE task_id = ?
+                    )
+                )
+                """
+            )
+            params.extend([int(task_id), int(task_id)])
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
         with closing(self.connect()) as db, db:
@@ -1145,8 +1329,11 @@ class Database:
                 for row in db.execute(
                     f"""
                     SELECT id, memo_date, content, tags, pinned,
+                           note_title, note_link,
                            source_entry_id, source_title, source_estimate_minutes,
                            source_actual_seconds, source_plan_date,
+                           source_kind, source_routine_id, source_thread_id,
+                           source_task_id,
                            created_at, updated_at, 'memo' AS kind
                     FROM memos
                     {where}
@@ -1156,7 +1343,7 @@ class Database:
                     params,
                 )
             ]
-            if not memo_date:
+            if not memo_date and not source_kind and task_id is None:
                 if clean_query:
                     daily_rows = db.execute(
                         """
@@ -1194,6 +1381,13 @@ class Database:
                         "source_estimate_minutes": None,
                         "source_actual_seconds": None,
                         "source_plan_date": None,
+                        "source_kind": "",
+                        "source_routine_id": None,
+                        "source_thread_id": None,
+                        "source_task_id": None,
+                        "note_title": "",
+                        "note_link": "",
+                        "source_thread_title": "",
                         "created_at": row["updated_at"],
                         "updated_at": row["updated_at"],
                         "kind": "daily",
@@ -1221,13 +1415,164 @@ class Database:
                 "day",
                 lambda item: str(item["memo_date"]),
             )
+            self._decorate_memo_sources(db, memos)
+            self._attach_reads(db, memos)
             return memos
+
+    def list_memo_sources(self) -> list[dict]:
+        with closing(self.connect()) as db:
+            thread_counts: dict[int, int] = {}
+            for row in db.execute(
+                """
+                SELECT thread_id, COUNT(*) AS total
+                FROM (
+                    SELECT source_thread_id AS thread_id
+                    FROM memos
+                    WHERE source_thread_id IS NOT NULL
+                    UNION ALL
+                    SELECT pe.thread_id
+                    FROM memos m
+                    JOIN plan_entries pe ON pe.id = m.source_entry_id
+                    WHERE m.source_thread_id IS NULL AND pe.thread_id IS NOT NULL
+                ) AS linked
+                GROUP BY thread_id
+                """
+            ):
+                thread_counts[int(row["thread_id"])] = int(row["total"])
+            routine_counts = {
+                int(row["source_routine_id"]): int(row["total"])
+                for row in db.execute(
+                    """
+                    SELECT source_routine_id, COUNT(*) AS total
+                    FROM memos
+                    WHERE source_routine_id IS NOT NULL
+                    GROUP BY source_routine_id
+                    """
+                )
+            }
+            sources = []
+            for row in db.execute(
+                "SELECT id, title, status, featured FROM threads ORDER BY featured DESC, id"
+            ):
+                thread_id = int(row["id"])
+                count = thread_counts.get(thread_id, 0)
+                if row["status"] != "active" and count == 0:
+                    continue
+                sources.append(
+                    {
+                        "kind": "thread",
+                        "id": thread_id,
+                        "title": row["title"],
+                        "count": count,
+                        "featured": bool(row["featured"]),
+                        "active": row["status"] == "active",
+                    }
+                )
+            for row in db.execute(
+                "SELECT id, title, active FROM routines ORDER BY sort_order, id"
+            ):
+                routine_id = int(row["id"])
+                count = routine_counts.get(routine_id, 0)
+                if not row["active"] and count == 0:
+                    continue
+                sources.append(
+                    {
+                        "kind": "routine",
+                        "id": routine_id,
+                        "title": row["title"],
+                        "count": count,
+                        "featured": False,
+                        "active": bool(row["active"]),
+                    }
+                )
+            sources.sort(
+                key=lambda item: (
+                    0 if item["kind"] == "thread" else 1,
+                    0 if item["featured"] else 1,
+                    0 if item["active"] else 1,
+                    -item["count"],
+                    item["id"],
+                )
+            )
+            return sources
+
+    @staticmethod
+    def _decorate_memo_sources(db: sqlite3.Connection, memos: list[dict]) -> None:
+        entry_ids = [
+            int(item["source_entry_id"])
+            for item in memos
+            if item.get("kind") == "memo" and item.get("source_entry_id")
+        ]
+        entry_threads: dict[int, int] = {}
+        entry_tasks: dict[int, int] = {}
+        if entry_ids:
+            placeholders = ",".join("?" * len(entry_ids))
+            for row in db.execute(
+                f"""
+                SELECT id, thread_id, task_id FROM plan_entries
+                WHERE id IN ({placeholders})
+                """,
+                entry_ids,
+            ):
+                entry_tasks[int(row["id"])] = int(row["task_id"])
+                if row["thread_id"]:
+                    entry_threads[int(row["id"])] = int(row["thread_id"])
+        thread_ids: set[int] = set()
+        for item in memos:
+            if item.get("kind") != "memo":
+                item["source_thread_title"] = ""
+                continue
+            if not item.get("source_thread_id") and item.get("source_entry_id"):
+                thread_id = entry_threads.get(int(item["source_entry_id"]))
+                if thread_id:
+                    item["source_thread_id"] = thread_id
+                    if not item.get("source_kind"):
+                        item["source_kind"] = "thread"
+            if not item.get("source_task_id") and item.get("source_entry_id"):
+                task_id = entry_tasks.get(int(item["source_entry_id"]))
+                if task_id:
+                    item["source_task_id"] = task_id
+                    if not item.get("source_kind") and not item.get("source_thread_id"):
+                        item["source_kind"] = "task"
+            if item.get("source_thread_id"):
+                thread_ids.add(int(item["source_thread_id"]))
+        titles: dict[int, str] = {}
+        if thread_ids:
+            placeholders = ",".join("?" * len(thread_ids))
+            for row in db.execute(
+                f"SELECT id, title FROM threads WHERE id IN ({placeholders})",
+                list(thread_ids),
+            ):
+                titles[int(row["id"])] = row["title"]
+        for item in memos:
+            if item.get("kind") != "memo":
+                continue
+            thread_id = item.get("source_thread_id")
+            item["source_thread_title"] = titles.get(int(thread_id), "") if thread_id else ""
+
+    @staticmethod
+    def _note_link(value: object) -> str:
+        link = str(value or "").strip()
+        if not link:
+            return ""
+        if len(link) > 500:
+            raise AppError("链接请控制在 500 个字符以内")
+        if re.match(r"^[a-z][a-z0-9+.-]*:", link, re.IGNORECASE) and not re.match(
+            r"^https?://", link, re.IGNORECASE
+        ):
+            raise AppError("请填写可以打开的网页链接")
+        if not re.match(r"^https?://", link, re.IGNORECASE):
+            link = f"https://{link}"
+        parsed = urlparse(link)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise AppError("请填写可以打开的网页链接")
+        return link
 
     def _memo_task_source(self, db: sqlite3.Connection, entry_id: int) -> dict:
         root = db.execute(
             """
-            SELECT pe.id, pe.plan_date, pe.estimate_minutes, t.id AS task_id,
-                   t.title, t.parent_id
+            SELECT pe.id, pe.plan_date, pe.estimate_minutes, pe.thread_id,
+                   t.id AS task_id, t.title, t.parent_id
             FROM plan_entries pe
             JOIN tasks t ON t.id = pe.task_id
             WHERE pe.id = ?
@@ -1280,12 +1625,69 @@ class Database:
                 continue
             start = datetime.fromisoformat(str(segment["start_at"]).replace("Z", "+00:00"))
             actual += max(0, int((now - start).total_seconds()))
+        thread_id = root["thread_id"]
         return {
+            "source_kind": "thread" if thread_id else "task",
             "source_entry_id": int(root["id"]),
+            "source_routine_id": None,
+            "source_thread_id": int(thread_id) if thread_id else None,
+            "source_task_id": int(root["task_id"]),
             "source_title": root["title"],
             "source_estimate_minutes": estimate,
             "source_actual_seconds": actual,
             "source_plan_date": root["plan_date"],
+        }
+
+    def _memo_routine_source(
+        self, db: sqlite3.Connection, raw_id: object, raw_date: object
+    ) -> dict:
+        try:
+            routine_id = int(raw_id)
+        except (TypeError, ValueError) as exc:
+            raise AppError("没有找到这项每日必做", HTTPStatus.NOT_FOUND) from exc
+        routine = db.execute(
+            "SELECT id, title FROM routines WHERE id = ?", (routine_id,)
+        ).fetchone()
+        if not routine:
+            raise AppError("没有找到这项每日必做", HTTPStatus.NOT_FOUND)
+        return {
+            "source_kind": "routine",
+            "source_entry_id": None,
+            "source_routine_id": int(routine["id"]),
+            "source_thread_id": None,
+            "source_task_id": None,
+            "source_title": routine["title"],
+            "source_estimate_minutes": None,
+            "source_actual_seconds": None,
+            "source_plan_date": valid_date(
+                raw_date or date.today().isoformat(), "记录日期"
+            ),
+        }
+
+    def _memo_thread_source(
+        self, db: sqlite3.Connection, raw_id: object, raw_date: object
+    ) -> dict:
+        try:
+            thread_id = int(raw_id)
+        except (TypeError, ValueError) as exc:
+            raise AppError("没有找到这条主线", HTTPStatus.NOT_FOUND) from exc
+        thread = db.execute(
+            "SELECT id, title FROM threads WHERE id = ?", (thread_id,)
+        ).fetchone()
+        if not thread:
+            raise AppError("没有找到这条主线", HTTPStatus.NOT_FOUND)
+        return {
+            "source_kind": "thread",
+            "source_entry_id": None,
+            "source_routine_id": None,
+            "source_thread_id": int(thread["id"]),
+            "source_task_id": None,
+            "source_title": thread["title"],
+            "source_estimate_minutes": None,
+            "source_actual_seconds": None,
+            "source_plan_date": valid_date(
+                raw_date or date.today().isoformat(), "记录日期"
+            ),
         }
 
     def create_memo(self, payload: dict) -> dict:
@@ -1294,8 +1696,12 @@ class Database:
         if not text and not payload.get("has_images"):
             raise AppError("先写下一点内容，或添加一张图片")
         tags = str(payload.get("tags", "")).strip()[:300]
+        note_title = str(payload.get("note_title", "")).strip()[:80]
+        note_link = self._note_link(payload.get("note_link"))
         now = utc_now()
         raw_entry = payload.get("entry_id")
+        raw_routine = payload.get("routine_id")
+        raw_thread = payload.get("thread_id")
         with closing(self.connect()) as db, db:
             source = None
             if raw_entry not in (None, ""):
@@ -1304,18 +1710,36 @@ class Database:
                 except (TypeError, ValueError) as exc:
                     raise AppError("任务不正确") from exc
                 source = self._memo_task_source(db, entry_id)
+            elif raw_routine not in (None, ""):
+                source = self._memo_routine_source(db, raw_routine, payload.get("date"))
+            elif raw_thread not in (None, ""):
+                source = self._memo_thread_source(db, raw_thread, payload.get("date"))
             memo_date = (
                 source["source_plan_date"]
                 if source
                 else valid_date(payload.get("date") or date.today().isoformat(), "记录日期")
             )
+            blank = {
+                "source_kind": "",
+                "source_entry_id": None,
+                "source_routine_id": None,
+                "source_thread_id": None,
+                "source_task_id": None,
+                "source_title": "",
+                "source_estimate_minutes": None,
+                "source_actual_seconds": None,
+                "source_plan_date": None,
+            }
+            source = source or blank
             cursor = db.execute(
                 """
                 INSERT INTO memos(
                     memo_date, content, tags, pinned, created_at, updated_at,
                     source_entry_id, source_title, source_estimate_minutes,
-                    source_actual_seconds, source_plan_date
-                ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+                    source_actual_seconds,                     source_plan_date,
+                    source_kind, source_routine_id, source_thread_id, source_task_id,
+                    note_title, note_link
+                ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     memo_date,
@@ -1323,11 +1747,17 @@ class Database:
                     tags,
                     now,
                     now,
-                    None if source is None else source["source_entry_id"],
-                    "" if source is None else source["source_title"],
-                    None if source is None else source["source_estimate_minutes"],
-                    None if source is None else source["source_actual_seconds"],
-                    None if source is None else source["source_plan_date"],
+                    source["source_entry_id"],
+                    source["source_title"],
+                    source["source_estimate_minutes"],
+                    source["source_actual_seconds"],
+                    source["source_plan_date"],
+                    source["source_kind"],
+                    source["source_routine_id"],
+                    source["source_thread_id"],
+                    source["source_task_id"],
+                    note_title,
+                    note_link,
                 ),
             )
             created = dict(
@@ -1405,8 +1835,128 @@ class Database:
                 "DELETE FROM note_images WHERE owner_type = 'memo' AND owner_key = ?",
                 (str(memo_id),),
             )
+            db.execute(
+                "DELETE FROM memo_reads WHERE owner_kind = 'memo' AND owner_key = ?",
+                (str(memo_id),),
+            )
         for image_id in image_ids:
             self._remove_image_files(image_id)
+
+    def mark_memo_read(self, payload: dict) -> dict:
+        kind, key = self._memo_read_target(payload)
+        now = utc_now()
+        today = date.today()
+        with closing(self.connect()) as db, db:
+            if kind == "memo":
+                exists = db.execute(
+                    "SELECT 1 FROM memos WHERE id = ?", (int(key),)
+                ).fetchone()
+                if not exists:
+                    raise AppError("没有找到这条感悟", HTTPStatus.NOT_FOUND)
+            current = db.execute(
+                """
+                SELECT read_count, last_read_at
+                FROM memo_reads
+                WHERE owner_kind = ? AND owner_key = ?
+                """,
+                (kind, key),
+            ).fetchone()
+            if current and self._read_on_local_day(current["last_read_at"], today):
+                return self._memo_read_payload(
+                    kind, key, current["read_count"], current["last_read_at"], False
+                )
+            db.execute(
+                """
+                INSERT INTO memo_reads(owner_kind, owner_key, read_count, last_read_at)
+                VALUES (?, ?, 1, ?)
+                ON CONFLICT(owner_kind, owner_key) DO UPDATE SET
+                    read_count = read_count + 1,
+                    last_read_at = excluded.last_read_at
+                """,
+                (kind, key, now),
+            )
+            row = db.execute(
+                """
+                SELECT read_count, last_read_at
+                FROM memo_reads
+                WHERE owner_kind = ? AND owner_key = ?
+                """,
+                (kind, key),
+            ).fetchone()
+        return self._memo_read_payload(kind, key, row["read_count"], row["last_read_at"], True)
+
+    @staticmethod
+    def _read_on_local_day(stamp: object, day: date) -> bool:
+        if not stamp:
+            return False
+        parsed = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        return parsed.astimezone().date() == day
+
+    @classmethod
+    def _memo_read_payload(
+        cls, kind: str, key: str, read_count: object, last_read_at: object, counted: bool
+    ) -> dict:
+        return {
+            "kind": kind,
+            "id": int(key) if kind == "memo" else key,
+            "read_count": int(read_count),
+            "last_read_at": last_read_at,
+            "read_today": cls._read_on_local_day(last_read_at, date.today()),
+            "counted": counted,
+        }
+
+    @staticmethod
+    def _memo_read_target(payload: dict) -> tuple[str, str]:
+        kind = str(payload.get("kind", "memo")).strip()
+        if kind not in {"memo", "daily"}:
+            raise AppError("记录类型不正确")
+        raw_id = payload.get("id")
+        if kind == "daily":
+            return kind, valid_date(raw_id, "记录日期")
+        if isinstance(raw_id, bool) or raw_id in (None, ""):
+            raise AppError("没有找到这条感悟", HTTPStatus.NOT_FOUND)
+        try:
+            memo_id = int(raw_id)
+        except (TypeError, ValueError) as exc:
+            raise AppError("没有找到这条感悟", HTTPStatus.NOT_FOUND) from exc
+        if memo_id <= 0:
+            raise AppError("没有找到这条感悟", HTTPStatus.NOT_FOUND)
+        return kind, str(memo_id)
+
+    @staticmethod
+    def _attach_reads(db: sqlite3.Connection, memos: list[dict]) -> None:
+        today = date.today()
+        for item in memos:
+            item["read_count"] = 0
+            item["last_read_at"] = None
+            item["read_today"] = False
+        grouped: dict[str, list[str]] = {"memo": [], "daily": []}
+        for item in memos:
+            kind = str(item.get("kind") or "")
+            if kind in grouped:
+                grouped[kind].append(str(item["id"]))
+        found: dict[tuple[str, str], sqlite3.Row] = {}
+        for kind, keys in grouped.items():
+            if not keys:
+                continue
+            placeholders = ",".join("?" * len(keys))
+            rows = db.execute(
+                f"""
+                SELECT owner_key, read_count, last_read_at
+                FROM memo_reads
+                WHERE owner_kind = ? AND owner_key IN ({placeholders})
+                """,
+                [kind, *keys],
+            )
+            for row in rows:
+                found[(kind, str(row["owner_key"]))] = row
+        for item in memos:
+            row = found.get((str(item.get("kind")), str(item["id"])))
+            if not row:
+                continue
+            item["read_count"] = int(row["read_count"])
+            item["last_read_at"] = row["last_read_at"]
+            item["read_today"] = Database._read_on_local_day(row["last_read_at"], today)
 
     def list_memo_templates(self) -> list[dict]:
         with closing(self.connect()) as db:
@@ -1813,6 +2363,347 @@ class Database:
             ).fetchone()
             return dict(row)
 
+    def _threads_for_day(self, db: sqlite3.Connection, plan_date: str) -> list[dict]:
+        anchor = datetime.strptime(plan_date, DATE_FORMAT).date()
+        previous = [
+            (anchor - timedelta(days=2)).isoformat(),
+            (anchor - timedelta(days=1)).isoformat(),
+        ]
+        tomorrow = (anchor + timedelta(days=1)).isoformat()
+        threads = [
+            dict(row)
+            for row in db.execute(
+                """
+                SELECT th.id, th.title, th.done_when, th.status, th.featured,
+                       p.name AS project_name
+                FROM threads th
+                LEFT JOIN projects p ON p.id = th.project_id
+                WHERE th.status IN ('active', 'paused')
+                ORDER BY th.featured DESC, th.status, th.id
+                """
+            )
+        ]
+        if not threads:
+            return []
+        ids = [int(item["id"]) for item in threads]
+        placeholders = ",".join("?" * len(ids))
+        dates = [*previous, plan_date, tomorrow]
+        date_marks = ",".join("?" * len(dates))
+        steps = {
+            (int(row["thread_id"]), row["plan_date"]): row
+            for row in db.execute(
+                f"""
+                SELECT pe.thread_id, pe.plan_date, pe.id, pe.outcome, t.title
+                FROM plan_entries pe
+                JOIN tasks t ON t.id = pe.task_id
+                WHERE pe.thread_id IN ({placeholders})
+                  AND pe.plan_date IN ({date_marks})
+                """,
+                [*ids, *dates],
+            )
+        }
+        note_counts = {
+            int(row["thread_id"]): int(row["total"])
+            for row in db.execute(
+                f"""
+                SELECT thread_id, COUNT(*) AS total
+                FROM (
+                    SELECT source_thread_id AS thread_id
+                    FROM memos
+                    WHERE source_thread_id IN ({placeholders})
+                    UNION ALL
+                    SELECT pe.thread_id
+                    FROM memos m
+                    JOIN plan_entries pe ON pe.id = m.source_entry_id
+                    WHERE m.source_thread_id IS NULL
+                      AND pe.thread_id IN ({placeholders})
+                ) AS linked
+                GROUP BY thread_id
+                """,
+                [*ids, *ids],
+            )
+        }
+        result = []
+        for item in threads:
+            thread_id = int(item["id"])
+            today = steps.get((thread_id, plan_date))
+            next_day = steps.get((thread_id, tomorrow))
+            today_outcome = today["outcome"] if today else None
+            result.append(
+                {
+                    "id": thread_id,
+                    "title": item["title"],
+                    "done_when": item["done_when"],
+                    "project_name": item["project_name"],
+                    "status": item["status"],
+                    "featured": bool(item["featured"]),
+                    "today_entry_id": int(today["id"]) if today else None,
+                    "needs_followup": (
+                        item["status"] == "active"
+                        and today_outcome == "completed"
+                        and next_day is None
+                    ),
+                    "note_count": note_counts.get(thread_id, 0),
+                    "recent": [
+                        {
+                            "date": day,
+                            "title": ""
+                            if steps.get((thread_id, day)) is None
+                            else steps[(thread_id, day)]["title"],
+                            "outcome": None
+                            if steps.get((thread_id, day)) is None
+                            else steps[(thread_id, day)]["outcome"],
+                        }
+                        for day in previous
+                    ],
+                }
+            )
+        result.sort(
+            key=lambda item: (
+                0 if item["featured"] else 1,
+                0 if item["status"] == "active" else 1,
+                item["id"],
+            )
+        )
+        return result
+
+    def create_thread(self, payload: dict) -> dict:
+        title = str(payload.get("title", "")).strip()
+        done_when = str(payload.get("done_when", "")).strip()
+        step = str(payload.get("step", "")).strip()
+        if not title:
+            raise AppError("先给这条主线起个名字")
+        if len(title) > 80:
+            raise AppError("主线名称请控制在 80 个字以内")
+        if not done_when:
+            raise AppError("先写下一句完成标准，怎样算这条主线做完")
+        if len(done_when) > 200:
+            raise AppError("完成标准请控制在 200 个字以内")
+        if not step:
+            raise AppError("先写下今天这一步")
+        if len(step) > 240:
+            raise AppError("这一步请控制在 240 个字以内")
+        plan_date = valid_date(payload.get("date"))
+        estimate = as_non_negative_int(payload.get("estimate_minutes", 30), "预估时间")
+        now = utc_now()
+        with closing(self.connect()) as db, db:
+            active = db.execute(
+                "SELECT COUNT(*) FROM threads WHERE status = 'active'"
+            ).fetchone()[0]
+            if int(active) >= 2:
+                raise AppError("同时进行的主线最多两条。先把一条暂停或做完")
+            project_id = self._project_id(db, payload.get("project_name"))
+            featured = 0 if int(active) else 1
+            cursor = db.execute(
+                """
+                INSERT INTO threads(
+                    title, done_when, project_id, status, featured,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, 'active', ?, ?, ?)
+                """,
+                (title, done_when, project_id, featured, now, now),
+            )
+            self._place_thread_step(
+                db,
+                int(cursor.lastrowid),
+                plan_date,
+                step,
+                estimate,
+                project_id,
+                now,
+            )
+        return self.get_day(plan_date)
+
+    def update_thread(self, thread_id: int, payload: dict) -> dict:
+        now = utc_now()
+        with closing(self.connect()) as db, db:
+            current = db.execute(
+                "SELECT * FROM threads WHERE id = ?", (thread_id,)
+            ).fetchone()
+            if not current:
+                raise AppError("没有找到这条主线", HTTPStatus.NOT_FOUND)
+            title = str(payload.get("title", current["title"])).strip()
+            done_when = str(payload.get("done_when", current["done_when"])).strip()
+            if not title:
+                raise AppError("先给这条主线起个名字")
+            if len(title) > 80:
+                raise AppError("主线名称请控制在 80 个字以内")
+            if not done_when:
+                raise AppError("先写下一句完成标准，怎样算这条主线做完")
+            if len(done_when) > 200:
+                raise AppError("完成标准请控制在 200 个字以内")
+            status = str(payload.get("status", current["status"]))
+            if status not in {"active", "paused", "done"}:
+                raise AppError("主线状态不正确")
+            if status == "active" and current["status"] != "active":
+                active = db.execute(
+                    "SELECT COUNT(*) FROM threads WHERE status = 'active'"
+                ).fetchone()[0]
+                if int(active) >= 2:
+                    raise AppError("同时进行的主线最多两条。先把一条暂停或做完")
+            featured = int(current["featured"])
+            if payload.get("featured") is True:
+                if status != "active":
+                    raise AppError("先恢复这条主线，再把它设为今天主推")
+                featured = 1
+            if status != "active":
+                featured = 0
+            project_id = current["project_id"]
+            if "project_name" in payload:
+                project_id = self._project_id(db, payload.get("project_name"))
+            db.execute(
+                """
+                UPDATE threads
+                SET title = ?, done_when = ?, project_id = ?, status = ?,
+                    featured = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (title, done_when, project_id, status, featured, now, thread_id),
+            )
+            if featured:
+                db.execute(
+                    """
+                    UPDATE threads
+                    SET featured = 0, updated_at = ?
+                    WHERE id <> ? AND featured = 1
+                    """,
+                    (now, thread_id),
+                )
+            self._ensure_featured_thread(db, now)
+            anchor = payload.get("date") or date.today().isoformat()
+        return self.get_day(valid_date(anchor))
+
+    def create_thread_step(self, thread_id: int, payload: dict) -> dict:
+        step = str(payload.get("step", payload.get("title", ""))).strip()
+        if not step:
+            raise AppError("先写下今天这一步")
+        if len(step) > 240:
+            raise AppError("这一步请控制在 240 个字以内")
+        plan_date = valid_date(payload.get("date"))
+        estimate = as_non_negative_int(payload.get("estimate_minutes", 30), "预估时间")
+        now = utc_now()
+        with closing(self.connect()) as db, db:
+            thread = db.execute(
+                "SELECT status, project_id FROM threads WHERE id = ?",
+                (thread_id,),
+            ).fetchone()
+            if not thread:
+                raise AppError("没有找到这条主线", HTTPStatus.NOT_FOUND)
+            if thread["status"] != "active":
+                raise AppError("先恢复这条主线，再写下今天这一步")
+            self._place_thread_step(
+                db,
+                thread_id,
+                plan_date,
+                step,
+                estimate,
+                thread["project_id"],
+                now,
+            )
+        return self.get_day(plan_date)
+
+    def _place_thread_step(
+        self,
+        db: sqlite3.Connection,
+        thread_id: int,
+        plan_date: str,
+        title: str,
+        estimate: int,
+        project_id: int | None,
+        now: str,
+    ) -> int:
+        existing = db.execute(
+            """
+            SELECT pe.id, pe.outcome, pe.task_id
+            FROM plan_entries pe
+            WHERE pe.plan_date = ? AND pe.thread_id = ?
+            """,
+            (plan_date, thread_id),
+        ).fetchone()
+        if existing:
+            if existing["outcome"] not in {"planned", "abandoned"}:
+                raise AppError("这一天主线已经有一步")
+            db.execute(
+                """
+                UPDATE tasks
+                SET title = ?, status = 'active', completed_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (title[:240], now, existing["task_id"]),
+            )
+            db.execute(
+                """
+                UPDATE plan_entries
+                SET estimate_minutes = ?, outcome = 'planned',
+                    unfinished_reason = NULL, reason_note = '',
+                    target_date = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (estimate, now, existing["id"]),
+            )
+            return int(existing["id"])
+        task_cursor = db.execute(
+            """
+            INSERT INTO tasks(
+                title, project_id, parent_id, definition,
+                status, created_at, updated_at
+            ) VALUES (?, ?, NULL, '', 'active', ?, ?)
+            """,
+            (title[:240], project_id, now, now),
+        )
+        next_order = db.execute(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 "
+            "FROM plan_entries WHERE plan_date = ?",
+            (plan_date,),
+        ).fetchone()[0]
+        entry_cursor = db.execute(
+            """
+            INSERT INTO plan_entries(
+                plan_date, task_id, estimate_minutes, sort_order,
+                thread_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                plan_date,
+                int(task_cursor.lastrowid),
+                estimate,
+                next_order,
+                thread_id,
+                now,
+                now,
+            ),
+        )
+        return int(entry_cursor.lastrowid)
+
+    @staticmethod
+    def _ensure_featured_thread(db: sqlite3.Connection, now: str) -> None:
+        db.execute(
+            "UPDATE threads SET featured = 0, updated_at = ? WHERE status <> 'active' AND featured = 1",
+            (now,),
+        )
+        active = db.execute(
+            """
+            SELECT id, featured FROM threads
+            WHERE status = 'active'
+            ORDER BY featured DESC, id
+            """
+        ).fetchall()
+        if not active:
+            return
+        featured = [row for row in active if int(row["featured"])]
+        keep = int(featured[0]["id"]) if len(featured) == 1 else int(active[0]["id"])
+        if len(featured) == 1 and int(featured[0]["id"]) == keep:
+            return
+        db.execute(
+            """
+            UPDATE threads
+            SET featured = CASE WHEN id = ? THEN 1 ELSE 0 END,
+                updated_at = ?
+            WHERE status = 'active'
+            """,
+            (keep, now),
+        )
+
     def close_day(self, payload: dict) -> dict:
         plan_date = valid_date(payload.get("date"))
         decisions = payload.get("decisions", [])
@@ -1831,9 +2722,11 @@ class Database:
         with closing(self.connect()) as db, db:
             pending = db.execute(
                 """
-                SELECT pe.id, pe.task_id, pe.estimate_minutes
+                SELECT pe.id, pe.task_id, pe.estimate_minutes, pe.thread_id,
+                       th.project_id AS thread_project_id, th.status AS thread_status
                 FROM plan_entries pe
                 JOIN tasks t ON t.id = pe.task_id
+                LEFT JOIN threads th ON th.id = pe.thread_id
                 WHERE pe.plan_date = ? AND pe.outcome = 'planned'
                 AND NOT EXISTS(
                     SELECT 1
@@ -1846,9 +2739,31 @@ class Database:
                 """,
                 (plan_date,),
             ).fetchall()
+            tomorrow = (
+                datetime.strptime(plan_date, DATE_FORMAT).date() + timedelta(days=1)
+            ).isoformat()
+            followups = db.execute(
+                """
+                SELECT pe.id, pe.estimate_minutes, pe.thread_id, th.project_id
+                FROM plan_entries pe
+                JOIN threads th ON th.id = pe.thread_id
+                WHERE pe.plan_date = ?
+                  AND pe.outcome = 'completed'
+                  AND th.status = 'active'
+                  AND NOT EXISTS(
+                      SELECT 1 FROM plan_entries next_step
+                      WHERE next_step.thread_id = pe.thread_id
+                        AND next_step.plan_date = ?
+                  )
+                """,
+                (plan_date, tomorrow),
+            ).fetchall()
             missing = [row["id"] for row in pending if row["id"] not in by_id]
             if missing:
                 raise AppError("还有未处理的任务，请为每一条选择去向")
+            missing_followups = [row["id"] for row in followups if row["id"] not in by_id]
+            if missing_followups:
+                raise AppError("主线还要写下明天的下一句")
 
             self.save_day(
                 {
@@ -1877,6 +2792,16 @@ class Database:
                         "updated_at = ? WHERE id = ?",
                         (now, now, row["task_id"]),
                     )
+                    if row["thread_id"] and row["thread_status"] == "active":
+                        self._place_thread_step(
+                            db,
+                            int(row["thread_id"]),
+                            tomorrow,
+                            self._thread_next_sentence(decision),
+                            int(row["estimate_minutes"] or 0),
+                            row["thread_project_id"],
+                            now,
+                        )
                     continue
 
                 reason = decision.get("reason")
@@ -1920,6 +2845,17 @@ class Database:
                     decision.get("next_estimate_minutes", row["estimate_minutes"]),
                     "下次预估时间",
                 )
+                if row["thread_id"] and row["thread_status"] == "active":
+                    self._place_thread_step(
+                        db,
+                        int(row["thread_id"]),
+                        target_date,
+                        self._thread_next_sentence(decision),
+                        next_estimate,
+                        row["thread_project_id"],
+                        now,
+                    )
+                    continue
                 next_order = db.execute(
                     "SELECT COALESCE(MAX(sort_order), 0) + 1 "
                     "FROM plan_entries WHERE plan_date = ?",
@@ -1951,6 +2887,17 @@ class Database:
                     (now, row["task_id"]),
                 )
 
+            for row in followups:
+                self._place_thread_step(
+                    db,
+                    int(row["thread_id"]),
+                    tomorrow,
+                    self._thread_next_sentence(by_id[int(row["id"])]),
+                    int(row["estimate_minutes"] or 0),
+                    row["project_id"],
+                    now,
+                )
+
             self._resolve_parent_entries(db, plan_date, now)
             db.execute(
                 "UPDATE days SET closed_at = ?, updated_at = ? "
@@ -1958,6 +2905,15 @@ class Database:
                 (now, now, plan_date),
             )
         return self.get_day(plan_date)
+
+    @staticmethod
+    def _thread_next_sentence(decision: dict) -> str:
+        sentence = str(decision.get("next_step", "")).strip()
+        if not sentence:
+            raise AppError("这条主线要写下明天的下一句")
+        if len(sentence) > 240:
+            raise AppError("这一步请控制在 240 个字以内")
+        return sentence
 
     def move_entry(self, entry_id: int, payload: dict) -> dict:
         target_date = valid_date(payload.get("date"), "目标日期")
@@ -1967,7 +2923,7 @@ class Database:
             root = db.execute(
                 """
                 SELECT pe.id, pe.plan_date, pe.outcome, pe.estimate_minutes,
-                       pe.task_id, t.parent_id, t.title
+                       pe.task_id, pe.thread_id, t.parent_id, t.title
                 FROM plan_entries pe
                 JOIN tasks t ON t.id = pe.task_id
                 WHERE pe.id = ?
@@ -1976,6 +2932,8 @@ class Database:
             ).fetchone()
             if not root:
                 raise AppError("没有找到这条任务", HTTPStatus.NOT_FOUND)
+            if root["thread_id"]:
+                raise AppError("主线的这一步留在当天，收工时写下明天接着做的一句")
             if root["outcome"] != "planned":
                 raise AppError("只有还没完成的任务可以移走")
             source_date = root["plan_date"]
@@ -3078,6 +4036,74 @@ class Database:
                 )
             return {"date": plan_date, "routines": self._routines_on(db, plan_date)}
 
+    def start_routine_timer(self, payload: dict) -> dict:
+        routine_id = as_non_negative_int(payload.get("routine_id"), "每日必做")
+        plan_date = valid_date(payload.get("date"))
+        if plan_date > date.today().isoformat():
+            raise AppError("还没到这一天，不能开始计时")
+        now = utc_now()
+        with closing(self.connect()) as db, db:
+            routine = db.execute(
+                "SELECT * FROM routines WHERE id = ?", (routine_id,)
+            ).fetchone()
+            if not routine or not routine["active"]:
+                raise AppError("没有找到这项每日必做", HTTPStatus.NOT_FOUND)
+            if plan_date < routine["created_on"]:
+                raise AppError("这一天还没有这项每日必做")
+            if routine["deactivated_on"] and plan_date >= routine["deactivated_on"]:
+                raise AppError("这项每日必做已经停用")
+            already = db.execute(
+                """
+                SELECT id FROM routine_segments
+                WHERE routine_id = ? AND plan_date = ? AND end_at IS NULL
+                """,
+                (routine_id, plan_date),
+            ).fetchone()
+            if already:
+                return {
+                    "already_running": True,
+                    "stopped_entry_id": None,
+                    "date": plan_date,
+                    "routines": self._routines_on(db, plan_date),
+                }
+            stopped = self._close_running(db, now)
+            self._close_running_routine(db, now)
+            db.execute(
+                """
+                INSERT INTO routine_segments(
+                    routine_id, plan_date, start_at, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (routine_id, plan_date, now, now),
+            )
+            return {
+                "already_running": False,
+                "stopped_entry_id": int(stopped["plan_entry_id"]) if stopped else None,
+                "date": plan_date,
+                "routines": self._routines_on(db, plan_date),
+            }
+
+    def stop_routine_timer(self, payload: dict) -> dict:
+        routine_id = as_non_negative_int(payload.get("routine_id"), "每日必做")
+        now = utc_now()
+        with closing(self.connect()) as db, db:
+            running = db.execute(
+                """
+                SELECT id, routine_id, plan_date, start_at
+                FROM routine_segments
+                WHERE end_at IS NULL
+                """
+            ).fetchone()
+            if not running or int(running["routine_id"]) != routine_id:
+                raise AppError("这项每日必做现在没有在计时")
+            self._close_running_routine(db, now)
+            return {
+                "stopped": True,
+                "duration_seconds": seconds_between(running["start_at"], now),
+                "date": running["plan_date"],
+                "routines": self._routines_on(db, running["plan_date"]),
+            }
+
     @staticmethod
     def _profile(db: sqlite3.Connection) -> dict:
         rows = {
@@ -3167,6 +4193,7 @@ class Database:
             "active": bool(row["active"]),
             "completed": completed,
             "locked": True,
+            "feedback_count": 0,
         }
 
     @staticmethod
@@ -3175,6 +4202,20 @@ class Database:
             int(row["routine_id"])
             for row in db.execute(
                 "SELECT routine_id FROM routine_checks WHERE plan_date = ?",
+                (plan_date,),
+            )
+        }
+        feedback = {
+            int(row["source_routine_id"]): int(row["total"])
+            for row in db.execute(
+                """
+                SELECT source_routine_id, COUNT(*) AS total
+                FROM memos
+                WHERE source_kind = 'routine'
+                  AND source_routine_id IS NOT NULL
+                  AND source_plan_date = ?
+                GROUP BY source_routine_id
+                """,
                 (plan_date,),
             )
         }
@@ -3187,9 +4228,29 @@ class Database:
             """,
             (plan_date,),
         ):
-            routines.append(
-                Database._public_routine(row, int(row["id"]) in completed)
-            )
+            item = Database._public_routine(row, int(row["id"]) in completed)
+            item["feedback_count"] = feedback.get(int(row["id"]), 0)
+            item["actual_seconds"] = 0
+            item["is_running"] = False
+            item["running_started_at"] = None
+            routines.append(item)
+        for row in db.execute(
+            """
+            SELECT routine_id, start_at, end_at, duration_seconds
+            FROM routine_segments
+            WHERE plan_date = ?
+            """,
+            (plan_date,),
+        ):
+            routine_id = int(row["routine_id"])
+            item = next((entry for entry in routines if entry["id"] == routine_id), None)
+            if not item:
+                continue
+            if row["end_at"]:
+                item["actual_seconds"] += int(row["duration_seconds"] or 0)
+            else:
+                item["is_running"] = True
+                item["running_started_at"] = row["start_at"]
         return routines
 
     @staticmethod
@@ -3363,13 +4424,59 @@ class RequestHandler(BaseHTTPRequestHandler):
                 limit = int(raw_limit)
             except ValueError as exc:
                 raise AppError("数量参数不正确") from exc
-            self._json(self.database.list_memos(search, memo_date, limit))
+            source_kind = query.get("source_kind", [""])[0]
+            raw_source = query.get("source_id", [None])[0]
+            raw_task = query.get("task_id", [None])[0]
+            source_id = None
+            task_id = None
+            if raw_source not in (None, ""):
+                try:
+                    source_id = int(raw_source)
+                except ValueError as exc:
+                    raise AppError("感悟来源不正确") from exc
+            if raw_task not in (None, ""):
+                try:
+                    task_id = int(raw_task)
+                except ValueError as exc:
+                    raise AppError("任务不正确") from exc
+            self._json(
+                self.database.list_memos(
+                    search, memo_date, limit, source_kind, source_id, task_id
+                )
+            )
+            return
+        if method == "GET" and path == "/api/memo-sources":
+            self._json(self.database.list_memo_sources())
             return
         if method == "POST" and path == "/api/entries":
             self._json(self.database.create_entry(self._body()), HTTPStatus.CREATED)
             return
+        if method == "POST" and path == "/api/threads":
+            self._json(self.database.create_thread(self._body()), HTTPStatus.CREATED)
+            return
+        thread_prefix = "/api/threads/"
+        if path.startswith(thread_prefix):
+            suffix = path[len(thread_prefix) :].strip("/")
+            parts = suffix.split("/")
+            if (
+                len(parts) == 2
+                and parts[0].isdigit()
+                and parts[1] == "steps"
+                and method == "POST"
+            ):
+                self._json(
+                    self.database.create_thread_step(int(parts[0]), self._body())
+                )
+                return
+            if len(parts) == 1 and parts[0].isdigit() and method == "PATCH":
+                self._json(self.database.update_thread(int(parts[0]), self._body()))
+                return
+            raise AppError("没有找到这个操作", HTTPStatus.NOT_FOUND)
         if method == "POST" and path == "/api/memos":
             self._json(self.database.create_memo(self._body()), HTTPStatus.CREATED)
+            return
+        if method == "POST" and path == "/api/memo-reads":
+            self._json(self.database.mark_memo_read(self._body()))
             return
         if method == "GET" and path == "/api/memo-templates":
             self._json(self.database.list_memo_templates())
@@ -3417,6 +4524,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return
         if method == "POST" and path == "/api/timer/start":
             payload = self._body()
+            if payload.get("routine_id") not in (None, ""):
+                self._json(self.database.start_routine_timer(payload))
+                return
             self._json(
                 self.database.start_timer(
                     as_non_negative_int(payload.get("entry_id"), "任务"),
@@ -3427,6 +4537,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if method == "POST" and path == "/api/timer/stop":
             payload = self._body()
+            if payload.get("routine_id") not in (None, ""):
+                self._json(self.database.stop_routine_timer(payload))
+                return
             raw_id = payload.get("entry_id")
             entry_id = (
                 None
@@ -3465,6 +4578,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if method == "POST" and path == "/api/routines/check":
             self._json(self.database.set_routine_check(self._body()))
+            return
+        if method == "POST" and path == "/api/routines/timer/start":
+            self._json(self.database.start_routine_timer(self._body()))
+            return
+        if method == "POST" and path == "/api/routines/timer/stop":
+            self._json(self.database.stop_routine_timer(self._body()))
             return
         if method == "POST" and path == "/api/routines":
             self._json(self.database.create_routine(self._body()), HTTPStatus.CREATED)
