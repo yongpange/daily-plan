@@ -262,7 +262,105 @@ class DatabaseTests(unittest.TestCase):
         reflection_results = self.database.list_memos("启动阻力")
 
         self.assertEqual(estimate_results[0]["id"], memo["id"])
+        self.assertEqual(estimate_results[0]["read_count"], 0)
         self.assertEqual(reflection_results[0]["kind"], "daily")
+
+    def test_memo_read_count_persists_and_clears_with_the_memo(self):
+        memo = self.database.create_memo(
+            {"date": self.today, "content": "估时要回头看倍率"}
+        )
+
+        first = self.database.mark_memo_read({"kind": "memo", "id": memo["id"]})
+        second = self.database.mark_memo_read({"kind": "memo", "id": str(memo["id"])})
+        listed = next(
+            item
+            for item in self.database.list_memos("倍率")
+            if item["kind"] == "memo"
+        )
+        reopened = Database(self.database.path)
+        kept = next(
+            item for item in reopened.list_memos("倍率") if item["kind"] == "memo"
+        )
+
+        self.assertEqual(first["read_count"], 1)
+        self.assertTrue(first["counted"])
+        self.assertTrue(first["read_today"])
+        self.assertEqual(second["read_count"], 1)
+        self.assertFalse(second["counted"])
+        self.assertEqual(listed["read_count"], 1)
+        self.assertTrue(listed["read_today"])
+        self.assertEqual(kept["read_count"], 1)
+        self.assertEqual(kept["last_read_at"], first["last_read_at"])
+
+        self.database.delete_memo(memo["id"])
+        with self.assertRaises(AppError):
+            self.database.mark_memo_read({"kind": "memo", "id": memo["id"]})
+        connection = self.database.connect()
+        try:
+            leftover = connection.execute(
+                "SELECT COUNT(*) FROM memo_reads WHERE owner_kind = 'memo' AND owner_key = ?",
+                (str(memo["id"]),),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(leftover, 0)
+
+    def test_memo_read_counts_again_on_a_later_day(self):
+        memo = self.database.create_memo(
+            {"date": self.today, "content": "估时要回头看倍率"}
+        )
+        self.database.mark_memo_read({"kind": "memo", "id": memo["id"]})
+        yesterday = datetime.now().astimezone().replace(
+            hour=15, minute=0, second=0, microsecond=0
+        ) - timedelta(days=1)
+        stamped = (
+            yesterday.astimezone(timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+        connection = self.database.connect()
+        try:
+            connection.execute(
+                """
+                UPDATE memo_reads
+                SET last_read_at = ?
+                WHERE owner_kind = 'memo' AND owner_key = ?
+                """,
+                (stamped, str(memo["id"])),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        again = self.database.mark_memo_read({"kind": "memo", "id": memo["id"]})
+        listed = next(
+            item
+            for item in self.database.list_memos("倍率")
+            if item["kind"] == "memo"
+        )
+
+        self.assertTrue(again["counted"])
+        self.assertEqual(again["read_count"], 2)
+        self.assertTrue(listed["read_today"])
+        self.assertEqual(listed["read_count"], 2)
+
+    def test_daily_reflection_read_count_is_stored_separately(self):
+        self.database.save_day(
+            {"date": self.today, "reflection": "拆任务能降低启动阻力"}
+        )
+
+        marked = self.database.mark_memo_read({"kind": "daily", "id": self.today})
+        again = self.database.mark_memo_read({"kind": "daily", "id": self.today})
+        listed = self.database.list_memos("启动阻力")
+
+        self.assertEqual(marked["read_count"], 1)
+        self.assertEqual(again["read_count"], 1)
+        self.assertFalse(again["counted"])
+        self.assertEqual(listed[0]["kind"], "daily")
+        self.assertEqual(listed[0]["read_count"], 1)
+        self.assertTrue(listed[0]["read_today"])
+        with self.assertRaises(AppError):
+            self.database.mark_memo_read({"kind": "note", "id": self.today})
 
     def test_month_and_quarter_reports_share_the_same_source_data(self):
         entry = self.add_entry("完成报告", estimate=60)
@@ -637,6 +735,271 @@ class DatabaseTests(unittest.TestCase):
         self.assertTrue(rows[0]["end_at"])
         with self.assertRaises(AppError):
             self.database.list_segments_between("2026-10-11", "2026-10-05")
+
+    def test_thread_carries_a_new_sentence_into_the_next_day(self):
+        opened = self.database.create_thread(
+            {
+                "date": self.today,
+                "title": "选品结论",
+                "done_when": "能讲清这个细分做不做",
+                "step": "拆 10 个竞品",
+                "project_name": "选品",
+            }
+        )
+        entry = next(item for item in opened["entries"] if item["thread_id"])
+        self.database.close_day(
+            {
+                "date": self.today,
+                "decisions": [
+                    {
+                        "entry_id": entry["id"],
+                        "action": "completed",
+                        "next_step": "把缺口写成三句话",
+                    }
+                ],
+            }
+        )
+
+        tomorrow = self.database.get_day("2026-10-11")
+        step = next(item for item in tomorrow["entries"] if item["thread_id"])
+        thread = tomorrow["threads"][0]
+
+        self.assertEqual(opened["threads"][0]["featured"], True)
+        self.assertEqual(opened["threads"][0]["project_name"], "选品")
+        self.assertEqual(step["title"], "把缺口写成三句话")
+        self.assertNotEqual(step["task_id"], entry["task_id"])
+        self.assertEqual(thread["recent"][1]["title"], "拆 10 个竞品")
+        self.assertEqual(thread["recent"][1]["outcome"], "completed")
+        self.assertEqual(thread["recent"][0]["title"], "")
+
+    def test_unfinished_thread_step_starts_tomorrow_from_the_stuck_point(self):
+        opened = self.database.create_thread(
+            {
+                "date": self.today,
+                "title": "选品结论",
+                "done_when": "能讲清这个细分做不做",
+                "step": "拆 10 个竞品",
+            }
+        )
+        entry = next(item for item in opened["entries"] if item["thread_id"])
+        self.database.close_day(
+            {
+                "date": self.today,
+                "decisions": [
+                    {
+                        "entry_id": entry["id"],
+                        "action": "carry",
+                        "reason": "underestimated",
+                        "target_date": "2026-10-11",
+                        "next_estimate_minutes": 40,
+                        "next_step": "先看完差评再写缺口",
+                    }
+                ],
+            }
+        )
+
+        tomorrow = self.database.get_day("2026-10-11")
+        titles = [item["title"] for item in tomorrow["entries"]]
+
+        self.assertEqual(titles, ["先看完差评再写缺口"])
+        self.assertEqual(tomorrow["entries"][0]["estimate_minutes"], 40)
+        self.assertEqual(tomorrow["entries"][0]["thread_id"], entry["thread_id"])
+
+    def test_checked_thread_step_still_asks_for_the_next_sentence(self):
+        opened = self.database.create_thread(
+            {
+                "date": self.today,
+                "title": "选品结论",
+                "done_when": "能讲清这个细分做不做",
+                "step": "拆 10 个竞品",
+            }
+        )
+        entry = next(item for item in opened["entries"] if item["thread_id"])
+        self.database.update_entry(entry["id"], {"outcome": "completed"})
+        with self.assertRaises(AppError):
+            self.database.close_day({"date": self.today, "decisions": []})
+
+        self.database.close_day(
+            {
+                "date": self.today,
+                "decisions": [
+                    {"entry_id": entry["id"], "next_step": "把缺口写成三句话"}
+                ],
+            }
+        )
+        tomorrow = self.database.get_day("2026-10-11")
+        self.assertEqual(tomorrow["entries"][0]["title"], "把缺口写成三句话")
+
+    def test_only_two_threads_can_stay_active(self):
+        first = self.database.create_thread(
+            {
+                "date": self.today,
+                "title": "选品结论",
+                "done_when": "能讲清做不做",
+                "step": "拆竞品",
+            }
+        )
+        self.database.create_thread(
+            {
+                "date": self.today,
+                "title": "每日计划",
+                "done_when": "主线能跨过明天",
+                "step": "把收工写上下一句",
+            }
+        )
+        with self.assertRaises(AppError):
+            self.database.create_thread(
+                {
+                    "date": self.today,
+                    "title": "第三条",
+                    "done_when": "不该同时开着",
+                    "step": "先停一条",
+                }
+            )
+
+        thread_id = first["threads"][0]["id"]
+        paused = self.database.update_thread(
+            thread_id, {"status": "paused", "date": self.today}
+        )
+        self.assertEqual(
+            [item["status"] for item in paused["threads"] if item["id"] == thread_id],
+            ["paused"],
+        )
+        self.assertEqual(
+            sum(1 for item in paused["threads"] if item["featured"]),
+            1,
+        )
+        resumed = self.database.create_thread(
+            {
+                "date": self.today,
+                "title": "学 SQL",
+                "done_when": "能自己写出那天的查询",
+                "step": "把连接表写一遍",
+            }
+        )
+        self.assertEqual(
+            sum(1 for item in resumed["threads"] if item["status"] == "active"),
+            2,
+        )
+
+    def test_routine_and_thread_notes_can_be_listed_by_source(self):
+        routine = self.database.create_routine(
+            {"title": "看生财有术文章", "note": "5 篇", "estimate_minutes": 15}
+        )
+        opened = self.database.create_thread(
+            {
+                "date": self.today,
+                "title": "小红书虚拟产品",
+                "done_when": "能讲清怎么卖",
+                "step": "拆三篇笔记",
+            }
+        )
+        thread = opened["threads"][0]
+        entry = next(item for item in opened["entries"] if item["thread_id"])
+        feedback_day = date.today().isoformat()
+        self.database.create_memo(
+            {
+                "date": feedback_day,
+                "content": "达人账号往往就是店铺号",
+                "routine_id": routine["id"],
+            }
+        )
+        self.database.create_memo(
+            {
+                "content": "拆笔记时先看收藏数",
+                "entry_id": entry["id"],
+            }
+        )
+        self.database.create_memo(
+            {"date": self.today, "content": "和这条主线无关的一句"}
+        )
+
+        routine_notes = self.database.list_memos(
+            source_kind="routine", source_id=routine["id"]
+        )
+        thread_notes = self.database.list_memos(
+            source_kind="thread", source_id=thread["id"]
+        )
+        sources = self.database.list_memo_sources()
+        day = self.database.get_day(feedback_day)
+        thread_day = self.database.get_day(self.today)
+
+        self.assertEqual([item["content"] for item in routine_notes], ["达人账号往往就是店铺号"])
+        self.assertEqual(routine_notes[0]["source_title"], "看生财有术文章")
+        self.assertEqual([item["content"] for item in thread_notes], ["拆笔记时先看收藏数"])
+        self.assertEqual(thread_notes[0]["source_thread_title"], "小红书虚拟产品")
+        self.assertEqual(
+            next(item for item in sources if item["kind"] == "routine")["count"],
+            1,
+        )
+        self.assertEqual(day["routines"][0]["feedback_count"], 1)
+        self.assertEqual(thread_day["threads"][0]["note_count"], 1)
+
+    def test_routine_timer_is_saved_and_yields_to_a_task_timer(self):
+        today = date.today().isoformat()
+        routine = self.database.create_routine(
+            {"title": "锻炼", "note": "5 分钟", "estimate_minutes": 5}
+        )
+        entry = self.database.create_entry(
+            {"date": today, "title": "写方案", "estimate_minutes": 30}
+        )
+        self.database.start_routine_timer(
+            {"routine_id": routine["id"], "date": today}
+        )
+        running = self.database.get_day(today)
+        routine_row = next(
+            item for item in running["routines"] if item["id"] == routine["id"]
+        )
+        self.assertTrue(routine_row["is_running"])
+        self.assertEqual(running["active_timer"]["routine_id"], routine["id"])
+
+        switched = self.database.start_timer(entry["id"])
+        after = self.database.get_day(today)
+        routine_after = next(
+            item for item in after["routines"] if item["id"] == routine["id"]
+        )
+
+        self.assertEqual(switched["stopped_routine_id"], routine["id"])
+        self.assertFalse(routine_after["is_running"])
+        self.assertGreaterEqual(routine_after["actual_seconds"], 0)
+        self.assertTrue(after["entries"][0]["is_running"])
+        self.assertTrue(any(item.get("kind") == "routine" for item in after["segments"]))
+
+    def test_task_notes_keep_title_link_and_share_the_task(self):
+        entry = self.add_entry("整理访谈提纲")
+        first = self.database.create_memo(
+            {
+                "content": "先把问题列出来",
+                "entry_id": entry["id"],
+                "note_title": "问题清单",
+                "note_link": "scys.com/article/1",
+            }
+        )
+        second = self.database.create_memo(
+            {
+                "content": "补充了一个例子",
+                "entry_id": entry["id"],
+                "note_title": "例子",
+                "note_link": "https://example.com/note",
+            }
+        )
+        notes = self.database.list_memos(task_id=entry["task_id"])
+
+        self.assertEqual(first["source_task_id"], entry["task_id"])
+        self.assertEqual(first["note_link"], "https://scys.com/article/1")
+        self.assertEqual(second["source_task_id"], entry["task_id"])
+        self.assertEqual(
+            {item["note_title"] for item in notes},
+            {"例子", "问题清单"},
+        )
+        with self.assertRaises(AppError):
+            self.database.create_memo(
+                {
+                    "content": "坏链接",
+                    "entry_id": entry["id"],
+                    "note_link": "javascript:alert(1)",
+                }
+            )
 
 
 class TaskNoteTests(unittest.TestCase):
