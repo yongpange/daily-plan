@@ -132,9 +132,33 @@
                 </div>
                 <div class="task-heading-actions">
                   <span id="capacityHint" class="capacity-hint"></span>
+                  <button id="openThreadForm" type="button" class="button subtle">开一条主线</button>
                   <button id="toggleAddTask" class="button primary">＋ 添加任务</button>
                 </div>
               </div>
+
+              <form id="threadForm" class="thread-form" hidden>
+                <label>
+                  <span>主线</span>
+                  <input id="threadTitle" type="text" maxlength="80" placeholder="例如：选品结论" required />
+                </label>
+                <label>
+                  <span>做到怎样算完</span>
+                  <input id="threadDoneWhen" type="text" maxlength="200" placeholder="一句话，例如：能讲清这个细分做不做" required />
+                </label>
+                <label>
+                  <span>今天这一步</span>
+                  <input id="threadStep" type="text" maxlength="240" placeholder="今天具体推进的那一句" required />
+                </label>
+                <label>
+                  <span>项目（可选）</span>
+                  <input id="threadProject" type="text" maxlength="80" list="projectOptions" placeholder="用来分类，不是主线本身" />
+                </label>
+                <div class="form-actions">
+                  <button id="cancelThread" type="button" class="button subtle">取消</button>
+                  <button type="submit" class="button primary">开始这条主线</button>
+                </div>
+              </form>
 
               <form id="addTaskForm" class="add-task-form" hidden>
                 <div id="subtaskContext" class="subtask-context" hidden>
@@ -340,20 +364,6 @@
         </div>
 
         <div class="week-layout">
-          <section class="panel week-chart-panel">
-            <div class="panel-header">
-              <div>
-                <p class="eyebrow">投入时间</p>
-                <h2>每天计划与实际</h2>
-              </div>
-              <div class="chart-legend">
-                <span><i class="planned-legend"></i>计划</span>
-                <span><i class="actual-legend"></i>实际</span>
-              </div>
-            </div>
-            <div id="weekChart" class="week-chart"></div>
-          </section>
-
           <section id="dayDetailPanel" class="panel day-detail-panel">
             <div class="panel-header">
               <div>
@@ -409,31 +419,11 @@
           <section class="panel">
             <div class="panel-header compact-header">
               <div>
-                <p class="eyebrow">偏差来源</p>
-                <h2>未完成原因</h2>
-              </div>
-            </div>
-            <div id="reasonList" class="rank-list"></div>
-          </section>
-
-          <section class="panel">
-            <div class="panel-header compact-header">
-              <div>
                 <p class="eyebrow">时间去向</p>
                 <h2>项目投入</h2>
               </div>
             </div>
             <div id="projectStats" class="project-stats"></div>
-          </section>
-
-          <section class="panel">
-            <div class="panel-header compact-header">
-              <div>
-                <p class="eyebrow">需要注意</p>
-                <h2>反复顺延</h2>
-              </div>
-            </div>
-            <div id="carryoverList" class="carryover-list"></div>
           </section>
 
           <section class="panel focus-stats-panel">
@@ -674,6 +664,7 @@
               </form>
               <div id="reminderList" class="reminder-list"></div>
             </section>
+            <div id="memoSourceFilters" class="memo-source-filters"></div>
             <div id="memoFilterSummary" class="memo-filter-summary"></div>
             <div id="memoFeed" class="memo-feed"></div>
           </section>
@@ -964,6 +955,17 @@
           </div>
           <button id="closeTaskNote" class="dialog-close" type="button" aria-label="关闭">×</button>
         </div>
+        <div id="taskNoteHistory" class="task-note-history" hidden></div>
+        <div class="field-row">
+          <label>
+            <span>标题</span>
+            <input id="taskNoteHeading" type="text" maxlength="80" placeholder="给这则感悟起个名字，可留空" />
+          </label>
+          <label>
+            <span>链接</span>
+            <input id="taskNoteLink" type="url" maxlength="500" placeholder="https:// 打开后在新标签页查看" />
+          </label>
+        </div>
         <div class="rich-note">
           <div class="rich-note-toolbar" role="toolbar" aria-label="排版">
             <button type="button" data-command="bold">加粗</button>
@@ -987,7 +989,7 @@
           <input id="taskNoteTags" type="text" maxlength="300" placeholder="用逗号分隔，可留空" />
           <div class="tag-presets" data-tag-input="taskNoteTags" hidden></div>
         </label>
-        <p class="task-note-hint">保存后会出现在右侧随手记录和感悟库里，并带上这条任务的标题、预估和实际时间。</p>
+        <p id="taskNoteHint" class="task-note-hint">保存后会出现在右侧随手记录和感悟库里，并带上这条任务的标题、预估和实际时间。</p>
         <div class="dialog-actions">
           <button id="cancelTaskNote" class="button subtle" type="button">取消</button>
           <button type="submit" class="button primary">保存到感悟库</button>

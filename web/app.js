@@ -53,6 +53,10 @@ const state = {
   closeMood: null,
   saveTimer: null,
   memoSearchTimer: null,
+  memoReadLocks: new Set(),
+  memoSource: null,
+  memoSources: [],
+  noteTarget: null,
   toastTimer: null,
   loadSequence: 0,
   finishingFocus: false,
@@ -395,7 +399,43 @@ function insertTemplate(editor, content) {
   syncRichEmpty(editor);
 }
 
+function safeHttpUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+    return parsed.href;
+  } catch {
+    return "";
+  }
+}
+
+function noteLinkMarkup(link) {
+  const href = safeHttpUrl(link);
+  if (!href) return "";
+  return `<a class="memo-link" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(href)}</a>`;
+}
+
+function noteHeadingMarkup(memo) {
+  const title = String(memo.note_title || "").trim();
+  const link = noteLinkMarkup(memo.note_link);
+  if (!title && !link) return "";
+  return `<div class="memo-note-heading">${title ? `<strong>${escapeHtml(title)}</strong>` : ""}${link}</div>`;
+}
+
 function memoSourceMarkup(memo) {
+  if (memo.source_kind === "routine" && memo.source_title) {
+    return `<div class="memo-source"><span>来自每日必做</span><strong>${escapeHtml(memo.source_title)}</strong></div>`;
+  }
+  if (memo.source_thread_title || (memo.source_kind === "thread" && memo.source_title)) {
+    const threadTitle = memo.source_thread_title || memo.source_title;
+    const step =
+      memo.source_entry_id && memo.source_title && memo.source_title !== threadTitle
+        ? `<em>这一步：${escapeHtml(memo.source_title)}</em>`
+        : "";
+    return `<div class="memo-source"><span>来自主线</span><strong>${escapeHtml(threadTitle)}</strong>${step}</div>`;
+  }
   if (!memo.source_title) return "";
   const estimate = Number(memo.source_estimate_minutes || 0)
     ? `预估 ${formatMinutes(memo.source_estimate_minutes)}`
@@ -428,6 +468,18 @@ function splitTags(value) {
     .split(/[,，\s]+/)
     .map((tag) => tag.trim())
     .filter(Boolean);
+}
+
+function liveRoutineSeconds(routine) {
+  const base = Number(routine.actual_seconds) || 0;
+  if (!routine.is_running || !routine.running_started_at) return base;
+  return (
+    base +
+    Math.max(
+      0,
+      Math.floor((Date.now() - new Date(routine.running_started_at).getTime()) / 1000),
+    )
+  );
 }
 
 function liveSeconds(entry) {
@@ -611,6 +663,113 @@ function entriesInTreeOrder(entries) {
   return result;
 }
 
+function threadTaskIds(entries) {
+  const roots = new Set(
+    entries.filter((entry) => entry.thread_id).map((entry) => entry.task_id),
+  );
+  const children = new Map();
+  entries.forEach((entry) => {
+    if (!entry.parent_id) return;
+    const list = children.get(entry.parent_id) || [];
+    list.push(entry.task_id);
+    children.set(entry.parent_id, list);
+  });
+  const family = new Set(roots);
+  const stack = [...roots];
+  while (stack.length) {
+    const taskId = stack.pop();
+    for (const child of children.get(taskId) || []) {
+      if (!family.has(child)) {
+        family.add(child);
+        stack.push(child);
+      }
+    }
+  }
+  return family;
+}
+
+function entriesUnderTask(rootTaskId, entries) {
+  const ids = new Set([rootTaskId]);
+  let growing = true;
+  while (growing) {
+    growing = false;
+    entries.forEach((entry) => {
+      if (entry.parent_id && ids.has(entry.parent_id) && !ids.has(entry.task_id)) {
+        ids.add(entry.task_id);
+        growing = true;
+      }
+    });
+  }
+  return entries.filter((entry) => ids.has(entry.task_id));
+}
+
+function threadRecentText(thread) {
+  const today = localDateString(new Date());
+  const labels =
+    state.date === today
+      ? ["前天", "昨天"]
+      : (thread.recent || []).map((item) =>
+          new Intl.DateTimeFormat("zh-CN", {
+            month: "numeric",
+            day: "numeric",
+          }).format(parseLocalDate(item.date)),
+        );
+  return (thread.recent || [])
+    .map((item, index) => {
+      let phrase = "没碰";
+      if (item.title) {
+        phrase =
+          item.outcome === "completed"
+            ? item.title
+            : item.outcome === "planned"
+              ? `${item.title}（还在做）`
+              : `${item.title}（未做完）`;
+      }
+      return `${labels[index] || ""}：${phrase}`;
+    })
+    .join(" · ");
+}
+
+function threadCardHtml(thread, entries) {
+  const paused = thread.status === "paused";
+  const kicker = paused ? "暂停的主线" : thread.featured ? "今天主推" : "另一条主线";
+  const feature = thread.featured
+    ? ""
+    : `<button type="button" data-thread-action="feature" data-thread-id="${thread.id}">今天主推</button>`;
+  const noteCount = Number(thread.note_count) || 0;
+  const noteButtons = `<button type="button" data-thread-action="note" data-thread-id="${thread.id}">写感悟</button><button type="button" data-thread-action="notes" data-thread-id="${thread.id}">全部感悟${noteCount ? ` · ${noteCount}` : ""}</button>`;
+  const actions = paused
+    ? `${noteButtons}<button type="button" data-thread-action="resume" data-thread-id="${thread.id}">恢复</button>`
+    : `${feature}${noteButtons}<button type="button" data-thread-action="pause" data-thread-id="${thread.id}">暂停</button><button type="button" data-thread-action="done" data-thread-id="${thread.id}">做完</button>`;
+  const root = entries.find((entry) => entry.id === thread.today_entry_id);
+  let step = "";
+  if (!paused && (!root || root.outcome === "abandoned")) {
+    step = `<form class="thread-step-form" data-thread-step="${thread.id}">
+      <input type="text" maxlength="240" required placeholder="今天这一步做什么" aria-label="今天这一步" />
+      <button type="submit">写下今天这一步</button>
+    </form>`;
+  } else if (root) {
+    step = `<div class="thread-step">${entriesInTreeOrder(entriesUnderTask(root.task_id, entries))
+      .map(({ entry, depth }) => taskRowHtml(entry, depth))
+      .join("")}</div>`;
+  }
+  const project = thread.project_name
+    ? `<span class="project-tag">${escapeHtml(thread.project_name)}</span>`
+    : "";
+  return `<section class="thread-card ${thread.featured ? "is-featured" : ""} ${paused ? "is-paused" : ""}">
+    <p class="thread-kicker">${kicker}</p>
+    <h3>${project}${escapeHtml(thread.title)}</h3>
+    <p class="thread-done">做到：${escapeHtml(thread.done_when)}</p>
+    <p class="thread-recent">${escapeHtml(threadRecentText(thread))}</p>
+    <div class="thread-actions">${actions}</div>
+    ${step}
+  </section>`;
+}
+
+function threadBoardHtml(entries) {
+  return (state.day.threads || []).map((thread) => threadCardHtml(thread, entries)).join("");
+}
+
 function renderTasks() {
   const list = $("#taskList");
   const empty = $("#emptyTasks");
@@ -618,15 +777,33 @@ function renderTasks() {
   const visible = entries.filter(
     (entry) => entry.outcome !== "carried" && entry.outcome !== "rescheduled",
   );
-  empty.hidden = visible.length > 0;
-  list.hidden = visible.length === 0;
-  if (!visible.length) {
+  const family = threadTaskIds(entries);
+  const loose = visible.filter((entry) => !family.has(entry.task_id));
+  const threads = state.day.threads || [];
+  const openThread = $("#openThreadForm");
+  if (openThread) {
+    const activeCount = threads.filter((item) => item.status === "active").length;
+    openThread.disabled = activeCount >= 2;
+    openThread.title = activeCount >= 2
+      ? "同时进行的主线最多两条。先把一条暂停或做完。"
+      : "";
+  }
+  const threadHtml = threadBoardHtml(entries);
+  empty.hidden = loose.length > 0 || threads.length > 0;
+  list.hidden = loose.length === 0 && !threadHtml;
+  if (!loose.length && !threadHtml) {
     list.innerHTML = "";
     return;
   }
 
-  list.innerHTML = entriesInTreeOrder(visible)
-    .map(({ entry, depth }) => {
+  list.innerHTML =
+    threadHtml +
+    entriesInTreeOrder(loose)
+    .map(({ entry, depth }) => taskRowHtml(entry, depth))
+    .join("");
+}
+
+function taskRowHtml(entry, depth) {
       const completed = entry.outcome === "completed";
       const finished = entry.outcome !== "planned";
       const actual = aggregateSeconds(entry);
@@ -679,7 +856,7 @@ function renderTasks() {
               <span class="${over ? "over-estimate" : ""}">
                 实际 <strong class="actual-time" data-entry-id="${entry.id}">${formatMinutes(actual / 60)}</strong>
               </span>
-              ${entry.outcome === "planned" ? '<span class="move-hint">右滑改期</span>' : ""}
+              ${entry.outcome === "planned" && !entry.thread_id ? '<span class="move-hint">右滑改期</span>' : ""}
               ${entry.definition?.trim() ? `<span class="note-hint">有说明</span>` : ""}
             </div>
             ${
@@ -707,8 +884,6 @@ function renderTasks() {
           </div>
         </article>
       `;
-    })
-    .join("");
 }
 
 function leafEntries(entries) {
@@ -723,26 +898,37 @@ function renderSummary() {
       (entry) => entry.outcome !== "carried" && entry.outcome !== "rescheduled",
     ),
   );
+  const routines = state.day.routines || [];
+  const routinePlanned = routines.reduce(
+    (sum, routine) => sum + Number(routine.estimate_minutes || 0),
+    0,
+  );
+  const routineActual = routines.reduce(
+    (sum, routine) => sum + liveRoutineSeconds(routine),
+    0,
+  );
+  const routineCompleted = routines.filter((routine) => routine.completed).length;
   const planned = entries.reduce(
     (sum, entry) => sum + Number(entry.estimate_minutes || 0),
     0,
-  );
+  ) + routinePlanned;
   const actualSeconds = allEntries.reduce(
     (sum, entry) => sum + liveSeconds(entry),
     0,
-  );
+  ) + routineActual;
   const completed = entries.filter(
     (entry) => entry.outcome === "completed",
-  ).length;
-  const rate = entries.length ? Math.round((completed / entries.length) * 100) : 0;
+  ).length + routineCompleted;
+  const totalCount = entries.length + routines.length;
+  const rate = totalCount ? Math.round((completed / totalCount) * 100) : 0;
   const variance = Math.round(actualSeconds / 60 - planned);
 
   $("#plannedTotal").textContent = formatMinutes(planned);
-  $("#plannedTaskCount").textContent = entries.length
-    ? `${entries.length} 条可执行任务`
+  $("#plannedTaskCount").textContent = totalCount
+    ? `${totalCount} 条可执行任务`
     : "还没有任务";
   $("#actualTotal").textContent = formatMinutes(actualSeconds / 60);
-  $("#completionTotal").textContent = `${completed} / ${entries.length}`;
+  $("#completionTotal").textContent = `${completed} / ${totalCount}`;
   $("#completionBar").style.width = `${rate}%`;
   $("#varianceTotal").textContent =
     actualSeconds === 0 && planned === 0
@@ -801,6 +987,8 @@ function renderWorklog() {
           ${
             running
               ? ""
+              : segment.kind === "routine"
+                ? ""
               : `<button class="worklog-edit" data-action="edit-segment"
                     data-segment-id="${segment.id}" aria-label="修正工作记录">···</button>`
           }
@@ -1317,6 +1505,14 @@ function updateLiveTimers() {
         timeElement.textContent = formatMinutes(aggregateSeconds(entry) / 60);
       }
     });
+    $$("[data-routine-time]").forEach((timeElement) => {
+      const routine = (state.day.routines || []).find(
+        (item) => item.id === Number(timeElement.dataset.routineTime),
+      );
+      if (routine) {
+        timeElement.textContent = `实际 ${formatMinutes(liveRoutineSeconds(routine) / 60)}`;
+      }
+    });
     renderSummary();
     if (state.day.segments?.some((segment) => !segment.end_at)) renderWorklog();
   }
@@ -1375,24 +1571,29 @@ async function startTimer(
   button,
   mode = "open",
   focusMinutes = 25,
+  routineId = null,
 ) {
   setBusy(button, true, mode === "focus" ? "准备专注…" : "启动中…");
   try {
     stopBreak();
     const result = await api("/api/timer/start", {
       method: "POST",
-      body: JSON.stringify({
-        entry_id: entryId,
-        mode,
-        focus_minutes: focusMinutes,
-      }),
+      body: JSON.stringify(
+        routineId
+          ? { routine_id: routineId, date: state.date, mode: "open" }
+          : {
+              entry_id: entryId,
+              mode,
+              focus_minutes: focusMinutes,
+            },
+      ),
     });
     if (state.view === "today") await loadDay();
     else await refreshGlobalTimer();
     notify(
-      result.stopped_entry_id
-        ? "已结束上一条任务，并开始新的计时"
-        : mode === "focus"
+      result.stopped_entry_id || result.stopped_routine_id
+        ? "已结束上一条计时，并开始新的计时"
+        : mode === "focus" && !routineId
           ? `开始 ${focusMinutes} 分钟专注`
           : "已经开始计时",
     );
@@ -1407,15 +1608,20 @@ async function stopTimer(
   entryId = null,
   button = null,
   targetReached = false,
+  routineId = null,
 ) {
   setBusy(button, true, "结束中…");
   try {
     const result = await api("/api/timer/stop", {
       method: "POST",
-      body: JSON.stringify({
-        entry_id: entryId,
-        target_reached: targetReached,
-      }),
+      body: JSON.stringify(
+        routineId
+          ? { routine_id: routineId }
+          : {
+              entry_id: entryId,
+              target_reached: targetReached,
+            },
+      ),
     });
     state.activeTimer = null;
     safeStorageRemove(STORAGE.timer);
@@ -1739,12 +1945,87 @@ function renderCloseMood() {
   });
 }
 
+async function submitThread(event) {
+  event.preventDefault();
+  const button = event.submitter;
+  if (button) setBusy(button, true, "保存中…");
+  try {
+    const data = await api("/api/threads", {
+      method: "POST",
+      body: JSON.stringify({
+        date: state.date,
+        title: $("#threadTitle").value,
+        done_when: $("#threadDoneWhen").value,
+        step: $("#threadStep").value,
+        project_name: $("#threadProject").value,
+      }),
+    });
+    $("#threadForm").hidden = true;
+    $("#threadForm").reset();
+    state.day = data;
+    state.activeTimer = data.active_timer;
+    state.mood = data.day.mood;
+    state.syncedAt = Date.now();
+    renderDay();
+    notify("主线已经开始，今天这一步在清单最上面");
+  } catch (error) {
+    reportError(error);
+  } finally {
+    if (button) setBusy(button, false);
+  }
+}
+
+async function submitThreadStep(form) {
+  const input = $("input", form);
+  const button = $("button", form);
+  setBusy(button, true, "保存中…");
+  try {
+    const data = await api(`/api/threads/${form.dataset.threadStep}/steps`, {
+      method: "POST",
+      body: JSON.stringify({ date: state.date, step: input.value }),
+    });
+    state.day = data;
+    state.activeTimer = data.active_timer;
+    state.mood = data.day.mood;
+    state.syncedAt = Date.now();
+    renderDay();
+  } catch (error) {
+    reportError(error);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function updateThread(id, payload, button) {
+  setBusy(button, true, "保存中…");
+  try {
+    const data = await api(`/api/threads/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ ...payload, date: state.date }),
+    });
+    state.day = data;
+    state.activeTimer = data.active_timer;
+    state.mood = data.day.mood;
+    state.syncedAt = Date.now();
+    renderDay();
+  } catch (error) {
+    reportError(error);
+  } finally {
+    setBusy(button, false);
+  }
+}
+
 function renderCloseTasks() {
   const pending = state.day.entries.filter(
     (entry) => entry.outcome === "planned" && !entry.has_children,
   );
+  const followups = state.day.entries.filter((entry) =>
+    (state.day.threads || []).some(
+      (thread) => thread.needs_followup && thread.today_entry_id === entry.id,
+    ),
+  );
   const container = $("#closeDayTasks");
-  if (!pending.length) {
+  if (!pending.length && !followups.length) {
     container.innerHTML =
       '<div class="empty-inline">今天的任务已经全部处理，可以直接写下感悟并收工。</div>';
     return;
@@ -1756,7 +2037,21 @@ function renderCloseTasks() {
     )
     .join("");
   const tomorrow = shiftDate(state.date, 1);
-  container.innerHTML = pending
+  const followupHtml = followups
+    .map(
+      (entry) => `
+        <article class="close-task" data-close-entry="${entry.id}" data-followup="1">
+          <strong>${escapeHtml(entry.title)}</strong>
+          <p class="thread-recent">这一步已经完成。写下明天接着做的一句，主线才会接上。</p>
+          <label class="note-field">
+            <span>明天接着做的一句</span>
+            <input data-field="next-step" type="text" maxlength="240" placeholder="明天打开就能接着做的那一句" />
+          </label>
+        </article>
+      `,
+    )
+    .join("");
+  container.innerHTML = followupHtml + pending
     .map(
       (entry) => `
         <article class="close-task" data-close-entry="${entry.id}">
@@ -1795,6 +2090,15 @@ function renderCloseTasks() {
                   placeholder="下次怎么避免，或卡在哪里？" />
               </label>
             </div>
+            ${
+              entry.thread_id
+                ? `<label class="note-field" data-next-wrap hidden>
+                    <span>明天接着做的一句</span>
+                    <input data-field="next-step" type="text" maxlength="240"
+                      placeholder="明天打开就能接着做的那一句" />
+                  </label>`
+                : ""
+            }
           </div>
         </article>
       `,
@@ -1811,6 +2115,16 @@ function updateCloseTaskDetails(select) {
   details.hidden = !action || action === "completed";
   target.hidden = action !== "reschedule";
   estimate.hidden = !["carry", "reschedule"].includes(action);
+  const nextWrap = $("[data-next-wrap]", card);
+  if (nextWrap) {
+    const show = ["completed", "carry", "reschedule"].includes(action);
+    nextWrap.hidden = !show;
+    const label = $("span", nextWrap);
+    if (label) {
+      label.textContent =
+        action === "carry" ? "卡在哪，明天从这里开始" : "明天接着做的一句";
+    }
+  }
 }
 
 async function submitCloseDay(event) {
@@ -1821,6 +2135,20 @@ async function submitCloseDay(event) {
   }
   const decisions = [];
   for (const card of $$("[data-close-entry]", $("#closeDayTasks"))) {
+    if (card.dataset.followup === "1") {
+      const nextStep = $('[data-field="next-step"]', card).value.trim();
+      if (!nextStep) {
+        notify("这条主线要写下明天的下一句", true);
+        $('[data-field="next-step"]', card).focus();
+        return;
+      }
+      decisions.push({
+        entry_id: Number(card.dataset.closeEntry),
+        action: "completed",
+        next_step: nextStep,
+      });
+      continue;
+    }
     const action = $('[data-field="action"]', card).value;
     if (!action) {
       notify("请为每一条任务选择去向", true);
@@ -1838,6 +2166,20 @@ async function submitCloseDay(event) {
       action === "carry"
         ? shiftDate(state.date, 1)
         : $('[data-field="target-date"]', card)?.value || null;
+    const nextStep = $('[data-field="next-step"]', card)?.value.trim() || "";
+    const threadEntry = state.day.entries.find(
+      (entry) => entry.id === Number(card.dataset.closeEntry),
+    );
+    if (threadEntry?.thread_id && action !== "abandoned" && !nextStep) {
+      notify(
+        action === "carry"
+          ? "写下卡在哪里，明天从这里开始"
+          : "这条主线要写下明天的下一句",
+        true,
+      );
+      $('[data-field="next-step"]', card)?.focus();
+      return;
+    }
     decisions.push({
       entry_id: Number(card.dataset.closeEntry),
       action,
@@ -1846,6 +2188,7 @@ async function submitCloseDay(event) {
       target_date: targetDate,
       next_estimate_minutes:
         $('[data-field="next-estimate"]', card)?.value || 0,
+      next_step: nextStep,
     });
   }
 
@@ -1995,61 +2338,328 @@ async function submitMemoCompose(event) {
   await loadSuggestedTags();
 }
 
+function openMemoSource(kind, id) {
+  state.memoSource = { kind, id: Number(id) };
+  if (state.view === "memos") loadMemos();
+  else switchView("memos");
+}
+
+function renderMemoSources() {
+  const bar = $("#memoSourceFilters");
+  if (!bar) return;
+  const sources = state.memoSources || [];
+  const current = state.memoSource;
+  const chips = [
+    `<button type="button" class="memo-source-chip ${current ? "" : "is-active"}" data-source-kind="">全部</button>`,
+    ...sources.map((source) => {
+      const active =
+        current &&
+        current.kind === source.kind &&
+        Number(current.id) === Number(source.id);
+      const label = source.kind === "thread" ? "主线" : "必做";
+      return `<button type="button" class="memo-source-chip ${active ? "is-active" : ""}" data-source-kind="${escapeHtml(source.kind)}" data-source-id="${source.id}"><span>${label}</span>${escapeHtml(source.title)}<strong>${source.count}</strong></button>`;
+    }),
+  ];
+  bar.innerHTML = chips.join("");
+}
+
 async function loadMemos() {
   const query = $("#memoSearchInput")?.value.trim() || "";
+  const source = state.memoSource;
+  const sourceQuery =
+    source?.kind && source.id
+      ? `&source_kind=${encodeURIComponent(source.kind)}&source_id=${encodeURIComponent(source.id)}`
+      : "";
   try {
-    state.memos = await api(
-      `/api/memos?query=${encodeURIComponent(query)}&limit=200`,
-    );
+    const [memos, sources] = await Promise.all([
+      api(`/api/memos?query=${encodeURIComponent(query)}&limit=200${sourceQuery}`),
+      api("/api/memo-sources"),
+    ]);
+    state.memos = memos;
+    state.memoSources = sources;
+    renderMemoSources();
     renderMemos(query);
   } catch (error) {
     reportError(error);
   }
 }
 
+function readStampCaption(count) {
+  const marks = {
+    1: "第一遍",
+    2: "又看了一眼",
+    3: "第三遍，有点熟了",
+    5: "五遍，记在身上",
+    7: "七遍了",
+    10: "十遍印",
+    21: "二十一遍，真记得",
+    50: "五十遍",
+    100: "百读不厌",
+  };
+  if (marks[count]) return marks[count];
+  if (count > 0 && count % 10 === 0) return `${count} 遍整`;
+  return `第 ${count} 遍`;
+}
+
+function formatReadMoment(value) {
+  if (!value) return "";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "";
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(parsed);
+}
+
+function readCountLabel(count, lastReadAt, readToday) {
+  const times = Number(count) || 0;
+  if (!times) return "看完点一下，今天记一次";
+  if (readToday) return `今天已阅，累计 ${times} 遍。明天再点会再记一遍`;
+  const when = formatReadMoment(lastReadAt);
+  return when
+    ? `已阅 ${times} 遍，上次 ${when}。今天再点一次`
+    : `已阅 ${times} 遍。今天再点一次`;
+}
+
+function memoReadMarkup(memo) {
+  const count = Number(memo.read_count) || 0;
+  const readToday = Boolean(memo.read_today);
+  const label = readCountLabel(count, memo.last_read_at, readToday);
+  const tone = readToday ? " is-today" : count ? " has-count" : "";
+  return `<button type="button" class="memo-read-mark${tone}" data-memo-action="read" data-memo-kind="${escapeHtml(memo.kind)}" data-memo-id="${escapeHtml(memo.id)}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}"><span class="memo-read-seal" aria-hidden="true">${readToday ? "已阅" : "阅"}</span>${count ? `<strong>${count}</strong>` : ""}</button>`;
+}
+
+function updateReadBadge(card, count, lastReadAt, readToday, pop) {
+  const button = card.querySelector(".memo-read-mark");
+  if (!button) return;
+  const times = Number(count) || 0;
+  const today = Boolean(readToday);
+  button.classList.toggle("has-count", times > 0 && !today);
+  button.classList.toggle("is-today", today);
+  card.classList.toggle("is-read-today", today);
+  const label = readCountLabel(times, lastReadAt, today);
+  button.title = label;
+  button.setAttribute("aria-label", label);
+  const seal = button.querySelector(".memo-read-seal");
+  if (seal) seal.textContent = today ? "已阅" : "阅";
+  let strong = button.querySelector("strong");
+  if (!times) {
+    strong?.remove();
+  } else {
+    if (!strong) {
+      strong = document.createElement("strong");
+      button.append(strong);
+    }
+    strong.textContent = String(times);
+  }
+  if (!pop) return;
+  button.classList.remove("is-pop");
+  void button.offsetWidth;
+  button.classList.add("is-pop");
+}
+
+function playReadStamp(card, count) {
+  card.querySelector(".read-stamp-pop")?.remove();
+  const stampId = String(Date.now());
+  card.dataset.stampId = stampId;
+  card.classList.add("is-stamping");
+  const milestone =
+    count === 1 || count % 10 === 0 || [3, 5, 7, 21].includes(count);
+  const pop = document.createElement("div");
+  pop.className = `read-stamp-pop${milestone ? " is-milestone" : ""}`;
+  pop.setAttribute("role", "status");
+  pop.innerHTML = `
+    <span class="read-stamp-ring"></span>
+    <span class="read-stamp-ink">
+      <strong>已阅</strong>
+      <em></em>
+    </span>
+    <span class="read-stamp-caption"></span>
+    <span class="read-stamp-speck"></span>
+    <span class="read-stamp-speck"></span>
+    <span class="read-stamp-speck"></span>
+    <span class="read-stamp-speck"></span>
+  `;
+  pop.querySelector("em").textContent = String(count);
+  pop.querySelector(".read-stamp-caption").textContent = readStampCaption(count);
+  card.append(pop);
+  window.setTimeout(() => {
+    if (card.dataset.stampId !== stampId) return;
+    pop.remove();
+    card.classList.remove("is-stamping");
+  }, 1400);
+}
+
+async function markMemoRead(card) {
+  if (!card) return;
+  const kind = card.dataset.memoKind;
+  const id = card.dataset.memoId;
+  if (!kind || !id) return;
+  const memo = state.memos.find(
+    (item) => item.kind === kind && String(item.id) === String(id),
+  );
+  if (memo?.read_today) return;
+  const lock = `${kind}:${id}`;
+  if (state.memoReadLocks.has(lock)) return;
+  state.memoReadLocks.add(lock);
+  try {
+    const result = await api("/api/memo-reads", {
+      method: "POST",
+      body: JSON.stringify({
+        kind,
+        id: kind === "memo" ? Number(id) : id,
+      }),
+    });
+    if (memo) {
+      memo.read_count = result.read_count;
+      memo.last_read_at = result.last_read_at;
+      memo.read_today = Boolean(result.read_today);
+    }
+    updateReadBadge(
+      card,
+      result.read_count,
+      result.last_read_at,
+      result.read_today,
+      result.counted,
+    );
+    if (result.counted) playReadStamp(card, result.read_count);
+    window.setTimeout(() => state.memoReadLocks.delete(lock), 900);
+  } catch (error) {
+    state.memoReadLocks.delete(lock);
+    reportError(error);
+  }
+}
+
+function isGroupedTaskMemo(memo) {
+  return (
+    memo.kind === "memo" &&
+    memo.source_kind === "task" &&
+    memo.source_task_id &&
+    !memo.source_thread_id
+  );
+}
+
+function memoCardMarkup(memo) {
+  const tags = splitTags(memo.tags);
+  const daily = memo.kind === "daily";
+  return `
+    <article class="memo-card ${memo.pinned ? "is-pinned" : ""} ${memo.read_today ? "is-read-today" : ""}" data-memo-id="${escapeHtml(memo.id)}" data-memo-kind="${escapeHtml(memo.kind)}">
+      <div class="memo-card-header">
+        <span>${memo.pinned ? "📌 " : ""}${formatMemoDate(memo.memo_date)}${daily ? " · 每日感悟" : ""}</span>
+        <div class="memo-card-actions">
+          ${memoReadMarkup(memo)}
+          ${
+            daily
+              ? `<button data-memo-action="promote" data-memo-id="${escapeHtml(memo.id)}">加入今天</button>
+                 <button data-memo-action="open-day" data-date="${memo.memo_date}">打开当天</button>`
+              : `<button data-memo-action="promote" data-memo-id="${escapeHtml(memo.id)}">加入今天</button>
+                 <button data-memo-action="pin" data-memo-id="${memo.id}">${memo.pinned ? "取消置顶" : "置顶"}</button>
+                 <button data-memo-action="edit" data-memo-id="${memo.id}">编辑</button>`
+          }
+        </div>
+      </div>
+      ${memoSourceMarkup(memo)}
+      ${noteHeadingMarkup(memo)}
+      ${memo.content ? `<div class="memo-content">${renderMemoHtml(memo.content)}</div>` : ""}
+      ${
+        (memo.images || []).length
+          ? `<div class="image-strip">${memo.images.map((image) => imageThumbMarkup(image, false)).join("")}</div>`
+          : ""
+      }
+      ${
+        tags.length
+          ? `<div class="memo-tags">${tags.map((tag) => `<span class="memo-tag">#${escapeHtml(tag)}</span>`).join("")}</div>`
+          : ""
+      }
+    </article>
+  `;
+}
+
+function taskMemoGroupMarkup(notes) {
+  const ordered = [...notes].sort((left, right) => {
+    const byDate = String(left.memo_date).localeCompare(String(right.memo_date));
+    if (byDate) return byDate;
+    return Number(left.id) - Number(right.id);
+  });
+  const newest = ordered[ordered.length - 1];
+  const taskId = newest.source_task_id;
+  const entryId = newest.source_entry_id;
+  const hidden = ordered.slice(0, -1);
+  return `
+    <article class="memo-card memo-group ${notes.some((item) => item.pinned) ? "is-pinned" : ""}">
+      <div class="memo-card-header">
+        <span>同一条任务 · ${ordered.length} 则感悟</span>
+        <div class="memo-card-actions">
+          <button type="button" data-memo-action="continue-task" data-task-id="${escapeHtml(taskId)}" data-entry-id="${escapeHtml(entryId || "")}" data-task-title="${escapeHtml(newest.source_title || "")}">继续写</button>
+        </div>
+      </div>
+      <div class="memo-source"><span>来自任务</span><strong>${escapeHtml(newest.source_title || "未命名任务")}</strong></div>
+      ${
+        hidden.length
+          ? `<details class="memo-group-earlier">
+              <summary>展开之前的 ${hidden.length} 则</summary>
+              ${hidden.map((note) => taskMemoPieceMarkup(note)).join("")}
+            </details>`
+          : ""
+      }
+      ${taskMemoPieceMarkup(ordered[ordered.length - 1])}
+    </article>
+  `;
+}
+
+function taskMemoPieceMarkup(note) {
+  return `
+    <section class="memo-group-piece">
+      <header>
+        <strong>${escapeHtml(note.note_title || "未写标题")}</strong>
+        <time>${escapeHtml(formatMemoDate(note.memo_date))}</time>
+      </header>
+      ${noteLinkMarkup(note.note_link)}
+      ${note.content ? `<div class="memo-content">${renderMemoHtml(note.content)}</div>` : ""}
+    </section>
+  `;
+}
+
 function renderMemos(query = "") {
-  $("#memoFilterSummary").textContent = query
-    ? `“${query}”找到 ${state.memos.length} 条记录（包含每日感悟）`
-    : `共显示 ${state.memos.length} 条记录`;
+  const source = state.memoSource;
+  const sourceTitle = (state.memoSources || []).find(
+    (item) =>
+      source &&
+      item.kind === source.kind &&
+      Number(item.id) === Number(source.id),
+  )?.title;
+  const sourceLabel = sourceTitle
+    ? source.kind === "thread"
+      ? `主线「${sourceTitle}」`
+      : `「${sourceTitle}」`
+    : "";
+  $("#memoFilterSummary").textContent = sourceLabel
+    ? query
+      ? `${sourceLabel}里，“${query}”找到 ${state.memos.length} 条感悟`
+      : `${sourceLabel}的感悟 · ${state.memos.length} 条`
+    : query
+      ? `“${query}”找到 ${state.memos.length} 条记录（包含每日感悟）`
+      : `共显示 ${state.memos.length} 条记录 · 看完点一下，一天记一遍`;
   const feed = $("#memoFeed");
   if (!state.memos.length) {
-    feed.innerHTML =
-      '<div class="panel empty-inline">还没有记录。想到一句就先记一句，不必等完整文章。</div>';
+    feed.innerHTML = sourceLabel
+      ? `<div class="panel empty-inline">${escapeHtml(sourceLabel)}还没有写下感悟。做完之后记一句，就会收在这里。</div>`
+      : '<div class="panel empty-inline">还没有记录。想到一句就先记一句，不必等完整文章。</div>';
     return;
   }
+  const seenTasks = new Set();
   feed.innerHTML = state.memos
     .map((memo) => {
-      const tags = splitTags(memo.tags);
-      const daily = memo.kind === "daily";
-      return `
-        <article class="memo-card ${memo.pinned ? "is-pinned" : ""}" data-memo-id="${escapeHtml(memo.id)}">
-          <div class="memo-card-header">
-            <span>${memo.pinned ? "📌 " : ""}${formatMemoDate(memo.memo_date)}${daily ? " · 每日感悟" : ""}</span>
-            <div class="memo-card-actions">
-              ${
-                daily
-                  ? `<button data-memo-action="promote" data-memo-id="${escapeHtml(memo.id)}">加入今天</button>
-                     <button data-memo-action="open-day" data-date="${memo.memo_date}">打开当天</button>`
-                  : `<button data-memo-action="promote" data-memo-id="${escapeHtml(memo.id)}">加入今天</button>
-                     <button data-memo-action="pin" data-memo-id="${memo.id}">${memo.pinned ? "取消置顶" : "置顶"}</button>
-                     <button data-memo-action="edit" data-memo-id="${memo.id}">编辑</button>`
-              }
-            </div>
-          </div>
-          ${memoSourceMarkup(memo)}
-          ${memo.content ? `<div class="memo-content">${renderMemoHtml(memo.content)}</div>` : ""}
-          ${
-            (memo.images || []).length
-              ? `<div class="image-strip">${memo.images.map((image) => imageThumbMarkup(image, false)).join("")}</div>`
-              : ""
-          }
-          ${
-            tags.length
-              ? `<div class="memo-tags">${tags.map((tag) => `<span class="memo-tag">#${escapeHtml(tag)}</span>`).join("")}</div>`
-              : ""
-          }
-        </article>
-      `;
+      if (!isGroupedTaskMemo(memo)) return memoCardMarkup(memo);
+      const key = String(memo.source_task_id);
+      if (seenTasks.has(key)) return "";
+      seenTasks.add(key);
+      const notes = state.memos.filter(
+        (item) => isGroupedTaskMemo(item) && String(item.source_task_id) === key,
+      );
+      return taskMemoGroupMarkup(notes);
     })
     .join("");
 }
@@ -2251,54 +2861,15 @@ function renderReport() {
         ? "刚好"
         : `${variance > 0 ? "+" : "−"}${formatMinutes(Math.abs(variance))}`;
 
-  renderReportChart();
   renderHeatmap();
   renderInsights();
-  renderReasons();
   renderProjectStats();
-  renderCarryovers();
   renderFocusStats();
   renderRoutineBoard();
   $("#weekReviewInput").value = state.report.review || "";
   $("#weekReviewStatus").textContent = "";
   ensureDayDetailDate();
   loadDayDetail();
-}
-
-function reportChartGroups() {
-  const days = state.report.days;
-  if (state.reportPeriod !== "quarter") {
-    return days.map((day) => ({
-      label:
-        state.reportPeriod === "week"
-          ? ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][
-              parseLocalDate(day.plan_date).getDay() === 0
-                ? 6
-                : parseLocalDate(day.plan_date).getDay() - 1
-            ]
-          : String(parseLocalDate(day.plan_date).getDate()),
-      date: day.plan_date,
-      estimate_minutes: Number(day.estimate_minutes || 0),
-      actual_seconds: Number(day.actual_seconds || 0),
-    }));
-  }
-  const groups = [];
-  for (let index = 0; index < days.length; index += 7) {
-    const chunk = days.slice(index, index + 7);
-    groups.push({
-      label: `第${Math.floor(index / 7) + 1}周`,
-      date: chunk[0].plan_date,
-      estimate_minutes: chunk.reduce(
-        (sum, day) => sum + Number(day.estimate_minutes || 0),
-        0,
-      ),
-      actual_seconds: chunk.reduce(
-        (sum, day) => sum + Number(day.actual_seconds || 0),
-        0,
-      ),
-    });
-  }
-  return groups;
 }
 
 function ensureDayDetailDate() {
@@ -2333,10 +2904,9 @@ async function loadDayDetail() {
       `/api/segments?start=${encodeURIComponent(range.start)}&end=${encodeURIComponent(range.end)}`,
     );
     if (sequence !== state.dayDetailSequence || state.dayDetailDate !== date) return;
-    const weekChanged = state.dayDetailWeek !== range.start;
     state.dayDetailWeek = range.start;
     state.daySegments = segments;
-    renderDayDetail(weekChanged);
+    renderDayDetail();
     $$("[data-chart-date]").forEach((column) => {
       column.classList.toggle("is-selected", column.dataset.chartDate === date);
     });
@@ -2395,7 +2965,7 @@ function layoutDayBlocks(segments) {
   return items;
 }
 
-function renderDayDetail(scrollIntoTime = false) {
+function renderDayDetail() {
   closeSegmentPopover();
   const date = state.dayDetailDate;
   const heading = $("#dayDetailTitle");
@@ -2478,12 +3048,6 @@ function renderDayDetail(scrollIntoTime = false) {
         </div>
       </div>
     </div>`;
-  if (scrollIntoTime) {
-    const scroller = $("#dayCalendarScroll");
-    const earliest = (state.daySegments || []).map(segmentBounds).sort((a, b) => a.start - b.start)[0];
-    const hour = earliest ? Math.max(0, Math.floor(earliest.start / 60) - 1) : 8;
-    scroller.scrollTop = hour * hourHeight;
-  }
 }
 
 function indexWeekend(date) {
@@ -2571,39 +3135,6 @@ async function editPopoverTask() {
   }
 }
 
-function renderReportChart() {
-  const groups = reportChartGroups();
-  const maximum = Math.max(
-    1,
-    ...groups.flatMap((item) => [
-      item.estimate_minutes,
-      item.actual_seconds / 60,
-    ]),
-  );
-  const chart = $("#weekChart");
-  const minimum = state.reportPeriod === "week" ? 70 : 34;
-  chart.style.gridTemplateColumns = `repeat(${groups.length}, minmax(${minimum}px, 1fr))`;
-  chart.innerHTML = groups
-    .map((item) => {
-      const planned = item.estimate_minutes;
-      const actual = item.actual_seconds / 60;
-      const dateValue = parseLocalDate(item.date);
-      return `
-        <div class="day-column ${item.date === state.dayDetailDate ? "is-selected" : ""}" data-chart-date="${escapeHtml(item.date)}">
-          <div class="bar-space" title="计划 ${formatMinutes(planned)}；实际 ${formatMinutes(actual)}">
-            <i class="chart-bar planned" style="height:${(planned / maximum) * 170}px"></i>
-            <i class="chart-bar actual" style="height:${(actual / maximum) * 170}px"></i>
-          </div>
-          <div class="day-label">
-            <strong>${escapeHtml(item.label)}</strong>
-            <span>${dateValue.getMonth() + 1}/${dateValue.getDate()}</span>
-          </div>
-        </div>
-      `;
-    })
-    .join("");
-}
-
 function renderHeatmap() {
   const days = state.report.days;
   const first = parseLocalDate(days[0].plan_date);
@@ -2641,31 +3172,6 @@ function renderInsights() {
     .join("");
 }
 
-function renderReasons() {
-  const reasons = state.report.reasons || [];
-  if (!reasons.length) {
-    $("#reasonList").innerHTML =
-      '<div class="empty-inline">本周期还没有未完成原因记录</div>';
-    return;
-  }
-  const maximum = Math.max(...reasons.map((item) => Number(item.count)));
-  $("#reasonList").innerHTML = reasons
-    .map(
-      (item) => `
-        <div class="rank-row">
-          <div class="rank-heading">
-            <span>${escapeHtml(item.label)}</span>
-            <strong>${item.count} 次</strong>
-          </div>
-          <div class="rank-track">
-            <span style="width:${(Number(item.count) / maximum) * 100}%"></span>
-          </div>
-        </div>
-      `,
-    )
-    .join("");
-}
-
 function renderProjectStats() {
   const projects = state.report.projects || [];
   if (!projects.length) {
@@ -2681,25 +3187,6 @@ function renderProjectStats() {
           <span class="project-actual">${formatMinutes(Number(project.actual_seconds) / 60)}</span>
           <span>计划 ${formatMinutes(project.estimate_minutes)} · 完成 ${project.completed_count}/${project.total_count}</span>
           <span>实际有效</span>
-        </div>
-      `,
-    )
-    .join("");
-}
-
-function renderCarryovers() {
-  const items = state.report.carryovers || [];
-  if (!items.length) {
-    $("#carryoverList").innerHTML =
-      '<div class="empty-inline">本周期没有连续顺延两次以上的任务</div>';
-    return;
-  }
-  $("#carryoverList").innerHTML = items
-    .map(
-      (item) => `
-        <div class="carryover-item">
-          <strong>${escapeHtml(item.title)}</strong>
-          <span>已经顺延 ${item.carry_count} 次，最新安排到 ${escapeHtml(item.latest_target_date || "未定")}</span>
         </div>
       `,
     )
@@ -2820,13 +3307,39 @@ function renderTodayRoutines() {
             <div class="routine-meta">
               <span>每日必做</span>
               ${routine.note ? `<span>${escapeHtml(routine.note)}</span>` : ""}
-              ${routine.estimate_minutes ? `<span>${formatMinutes(routine.estimate_minutes)}</span>` : ""}
+              ${routine.estimate_minutes ? `<span>预估 ${formatMinutes(routine.estimate_minutes)}</span>` : ""}
+              <span class="routine-actual" data-routine-time="${routine.id}">实际 ${formatMinutes(liveRoutineSeconds(routine) / 60)}</span>
               <span>${future ? "还没到这一天" : "首页不能修改"}</span>
             </div>
+            ${
+              future
+                ? ""
+                : `<div class="routine-feedback">
+                    ${
+                      routine.is_running
+                        ? `<button type="button" class="is-running" data-action="stop-routine" data-routine-id="${routine.id}">■ 结束计时</button>`
+                        : `<button type="button" data-action="start-routine" data-routine-id="${routine.id}">▶ 开始</button>`
+                    }
+                    ${
+                      done
+                        ? `<button type="button" data-action="routine-note" data-routine-id="${routine.id}">写反馈</button>
+                           <button type="button" data-action="routine-notes" data-routine-id="${routine.id}">全部反馈${Number(routine.feedback_count) ? ` · ${routine.feedback_count}` : ""}</button>`
+                        : ""
+                    }
+                  </div>`
+            }
           </div>
         </article>`;
     })
     .join("");
+}
+
+async function startRoutineTimer(routineId, button) {
+  return startTimer(null, button, "open", 25, routineId);
+}
+
+async function stopRoutineTimer(routineId, button) {
+  return stopTimer(null, button, false, routineId);
 }
 
 async function toggleRoutine(routineId, completed) {
@@ -2841,7 +3354,14 @@ async function toggleRoutine(routineId, completed) {
     });
     if (state.day) state.day.routines = result.routines;
     renderTodayRoutines();
-    notify(completed ? "今日必做已打卡" : "已取消今天的打卡");
+    if (completed) {
+      const routine = (result.routines || []).find(
+        (item) => Number(item.id) === Number(routineId),
+      );
+      if (routine) openRoutineFeedback(routine);
+      return;
+    }
+    notify("已取消今天的打卡");
   } catch (error) {
     reportError(error);
   }
@@ -3359,17 +3879,96 @@ function taskTreeEstimate(entry) {
   return children.reduce((sum, child) => sum + taskTreeEstimate(child), 0);
 }
 
+function showNoteDialog(target) {
+  state.noteTarget = target;
+  state.taskNoteEntryId = target.entryId || null;
+  $("#taskNoteTitle").textContent = target.title;
+  $("#taskNoteMeta").textContent = target.meta;
+  $("#taskNoteHint").textContent = target.hint;
+  const editor = richEditor("taskNoteContent");
+  if (editor) editor.dataset.placeholder = target.placeholder;
+  clearRich("taskNoteContent");
+  $("#taskNoteHeading").value = "";
+  $("#taskNoteLink").value = "";
+  $("#taskNoteTags").value = "";
+  renderTagPresets();
+  const history = $("#taskNoteHistory");
+  history.hidden = true;
+  history.innerHTML = "";
+  $("#taskNoteDialog").showModal();
+  if (target.kind === "task" && target.taskId) loadTaskNoteHistory(target.taskId);
+}
+
+async function loadTaskNoteHistory(taskId) {
+  const history = $("#taskNoteHistory");
+  try {
+    const notes = await api(`/api/memos?task_id=${encodeURIComponent(taskId)}&limit=100`);
+    const items = (notes || []).filter((item) => item.kind === "memo");
+    if (!items.length || state.noteTarget?.taskId !== taskId) {
+      history.hidden = true;
+      return;
+    }
+    const ordered = [...items].reverse();
+    history.hidden = false;
+    history.innerHTML = `<p>之前写在这条任务下的感悟</p>${ordered
+      .map(
+        (note) => `
+          <article>
+            <header>
+              <strong>${escapeHtml(note.note_title || "未写标题")}</strong>
+              <time>${escapeHtml(formatMemoDate(note.memo_date))}</time>
+            </header>
+            ${noteLinkMarkup(note.note_link)}
+            ${note.content ? `<div class="memo-content">${renderMemoHtml(note.content)}</div>` : ""}
+          </article>`,
+      )
+      .join("")}`;
+  } catch (error) {
+    history.hidden = true;
+    reportError(error);
+  }
+}
+
 function openTaskNote(entry) {
-  state.taskNoteEntryId = entry.id;
-  $("#taskNoteTitle").textContent = entry.title;
   const estimate = taskTreeEstimate(entry);
   const actual = aggregateSeconds(entry);
   const estimateText = estimate ? `预估 ${formatMinutes(estimate)}` : "未设预估";
-  $("#taskNoteMeta").textContent = `${formatMemoDate(state.date)} · ${estimateText} · 实际 ${formatMinutes(actual / 60)}`;
-  clearRich("taskNoteContent");
-  $("#taskNoteTags").value = "";
-  renderTagPresets();
-  $("#taskNoteDialog").showModal();
+  const thread = (state.day?.threads || []).find(
+    (item) => item.today_entry_id === entry.id || item.id === entry.thread_id,
+  );
+  showNoteDialog({
+    kind: entry.thread_id ? "thread-step" : "task",
+    entryId: entry.id,
+    taskId: entry.thread_id ? null : entry.task_id,
+    title: entry.title,
+    meta: `${formatMemoDate(state.date)} · ${estimateText} · 实际 ${formatMinutes(actual / 60)}${thread ? ` · 主线 ${thread.title}` : ""}`,
+    hint: thread
+      ? "保存后归到这条主线下面，感悟库里可以一次看完。"
+      : "会收在这条任务下面。下次打开，先看到以前写的，再往下继续。",
+    placeholder: "这个任务做完，真正留下的是什么？",
+  });
+}
+
+function openRoutineFeedback(routine) {
+  showNoteDialog({
+    kind: "routine",
+    routineId: routine.id,
+    title: routine.title,
+    meta: `${formatMemoDate(state.date)} · 每日必做`,
+    hint: "保存后出现在感悟库，并能按这项必做一次看完。",
+    placeholder: "今天看完，留下什么？",
+  });
+}
+
+function openThreadFeedback(thread) {
+  showNoteDialog({
+    kind: "thread",
+    threadId: thread.id,
+    title: thread.title,
+    meta: `${formatMemoDate(state.date)} · 主线 · 做到：${thread.done_when}`,
+    hint: "保存后归到这条主线下面，感悟库里可以一次看完。",
+    placeholder: "这条主线今天推进之后，留下什么？",
+  });
 }
 
 async function submitTaskNote(event) {
@@ -3379,22 +3978,27 @@ async function submitTaskNote(event) {
     notify("先写下一点感悟", true);
     return;
   }
+  const target = state.noteTarget;
+  if (!target) return;
   const button = event.submitter;
-  const memo = await createMemo(
-    {
-      date: state.date,
-      content,
-      content_format: "rich",
-      tags: $("#taskNoteTags").value,
-      entry_id: state.taskNoteEntryId,
-    },
-    button,
-  );
+  const payload = {
+    date: state.date,
+    content,
+    content_format: "rich",
+    tags: $("#taskNoteTags").value,
+    note_title: $("#taskNoteHeading").value,
+    note_link: $("#taskNoteLink").value,
+  };
+  if (target.entryId) payload.entry_id = target.entryId;
+  if (target.kind === "routine") payload.routine_id = target.routineId;
+  if (target.kind === "thread") payload.thread_id = target.threadId;
+  const memo = await createMemo(payload, button);
   if (!memo) return;
   $("#taskNoteDialog").close();
   clearRich("taskNoteContent");
-  await loadDay();
-  await loadMemos();
+  state.noteTarget = null;
+  if (state.view === "today") await loadDay();
+  if (state.view === "memos") await loadMemos();
 }
 
 function renderTemplates() {
@@ -3777,7 +4381,44 @@ function bindEvents() {
   });
   $("#addTaskForm").addEventListener("submit", createTask);
 
+  $("#openThreadForm").addEventListener("click", () => {
+    $("#threadForm").hidden = false;
+    $("#threadTitle").focus();
+  });
+  $("#cancelThread").addEventListener("click", () => {
+    $("#threadForm").hidden = true;
+  });
+  $("#threadForm").addEventListener("submit", submitThread);
+  $("#taskList").addEventListener("submit", (event) => {
+    const form = event.target.closest("[data-thread-step]");
+    if (!form) return;
+    event.preventDefault();
+    submitThreadStep(form);
+  });
   $("#taskList").addEventListener("click", (event) => {
+    const threadButton = event.target.closest("[data-thread-action]");
+    if (threadButton) {
+      const id = Number(threadButton.dataset.threadId);
+      const action = threadButton.dataset.threadAction;
+      if (action === "note" || action === "notes") {
+        const thread = (state.day?.threads || []).find((item) => item.id === id);
+        if (!thread) return;
+        if (action === "note") openThreadFeedback(thread);
+        else openMemoSource("thread", id);
+        return;
+      }
+      if (action === "done" && !window.confirm("这条主线已经做到完成标准了吗？")) {
+        return;
+      }
+      const payload = {
+        feature: { featured: true },
+        pause: { status: "paused" },
+        resume: { status: "active" },
+        done: { status: "done" },
+      }[action];
+      if (payload) updateThread(id, payload, threadButton);
+      return;
+    }
     const button = event.target.closest("[data-action]");
     if (!button) return;
     if (button.dataset.action === "copy-link") {
@@ -3960,22 +4601,58 @@ function bindEvents() {
     $("#memoSearchInput").value = "";
     loadMemos();
   });
+  $("#memoSourceFilters").addEventListener("click", (event) => {
+    const chip = event.target.closest("[data-source-kind]");
+    if (!chip) return;
+    const kind = chip.dataset.sourceKind;
+    state.memoSource = kind
+      ? { kind, id: Number(chip.dataset.sourceId) }
+      : null;
+    loadMemos();
+  });
   $("#memoFeed").addEventListener("click", (event) => {
     const button = event.target.closest("[data-memo-action]");
-    if (!button) return;
-    if (button.dataset.memoAction === "promote") {
-      promoteMemo(button.dataset.memoId, button);
+    if (button) {
+      if (button.dataset.memoAction === "continue-task") {
+        openTaskNote({
+          id: Number(button.dataset.entryId),
+          task_id: Number(button.dataset.taskId),
+          title: button.dataset.taskTitle || "这条任务",
+          thread_id: null,
+          estimate_minutes: 0,
+        });
+        return;
+      }
+      if (button.dataset.memoAction === "read") {
+        markMemoRead(button.closest(".memo-card"));
+      }
+      if (button.dataset.memoAction === "promote") {
+        promoteMemo(button.dataset.memoId, button);
+      }
+      if (button.dataset.memoAction === "edit") {
+        openMemoEdit(Number(button.dataset.memoId));
+      }
+      if (button.dataset.memoAction === "pin") {
+        toggleMemoPin(Number(button.dataset.memoId));
+      }
+      if (button.dataset.memoAction === "open-day") {
+        state.date = button.dataset.date;
+        switchView("today");
+      }
+      return;
     }
-    if (button.dataset.memoAction === "edit") {
-      openMemoEdit(Number(button.dataset.memoId));
+    if (
+      event.target.closest(
+        "a, button, input, textarea, label, .image-thumb, .image-remove",
+      )
+    ) {
+      return;
     }
-    if (button.dataset.memoAction === "pin") {
-      toggleMemoPin(Number(button.dataset.memoId));
-    }
-    if (button.dataset.memoAction === "open-day") {
-      state.date = button.dataset.date;
-      switchView("today");
-    }
+    const card = event.target.closest(".memo-card");
+    if (!card) return;
+    const selection = window.getSelection();
+    if (selection && !selection.isCollapsed) return;
+    markMemoRead(card);
   });
   $("#memoEditForm").addEventListener("submit", saveMemoEdit);
   $("#deleteMemo").addEventListener("click", deleteMemo);
@@ -4006,13 +4683,6 @@ function bindEvents() {
     if (button.dataset.templateAction === "delete") deleteTemplate(template.id, button);
   });
   $("#saveWeekReview").addEventListener("click", saveReportReview);
-  $("#weekChart").addEventListener("click", (event) => {
-    const column = event.target.closest("[data-chart-date]");
-    if (!column) return;
-    state.dayDetailDate = column.dataset.chartDate;
-    loadDayDetail();
-    $("#dayDetailPanel")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  });
   $("#dayDetailDate").addEventListener("change", (event) => {
     if (!event.target.value) return;
     state.dayDetailDate = event.target.value;
@@ -4064,6 +4734,21 @@ function bindEvents() {
         Number(button.dataset.routineId),
         button.dataset.completed !== "1",
       );
+    }
+    if (button.dataset.action === "start-routine") {
+      startRoutineTimer(Number(button.dataset.routineId), button);
+    }
+    if (button.dataset.action === "stop-routine") {
+      stopRoutineTimer(Number(button.dataset.routineId), button);
+    }
+    if (button.dataset.action === "routine-note") {
+      const routine = (state.day?.routines || []).find(
+        (item) => Number(item.id) === Number(button.dataset.routineId),
+      );
+      if (routine) openRoutineFeedback(routine);
+    }
+    if (button.dataset.action === "routine-notes") {
+      openMemoSource("routine", button.dataset.routineId);
     }
   });
   $("#profileForm").addEventListener("submit", saveProfile);
