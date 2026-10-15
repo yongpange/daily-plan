@@ -1056,10 +1056,48 @@ class TaskNoteTests(unittest.TestCase):
         self.assertEqual(memo["memo_date"], self.today)
         self.assertIn("关键一步", memo["content"])
         self.assertEqual(self.database.list_memos("主任务留下感悟")[0]["id"], memo["id"])
+        second = self.database.create_memo(
+            {"entry_id": parent["id"], "content": "同一天主任务的第二条"}
+        )
+        same_day = self.database.list_memos(
+            memo_date=self.today, task_id=parent["task_id"]
+        )
+        self.assertEqual({item["id"] for item in same_day}, {memo["id"], second["id"]})
+        self.assertTrue(
+            all(item["source_task_id"] == parent["task_id"] for item in same_day)
+        )
+        self.assertTrue(
+            all(item["source_title"] == "主任务留下感悟" for item in same_day)
+        )
         with self.assertRaises(AppError):
             self.database.create_memo(
                 {"entry_id": child["id"], "content": "子任务不单独记"}
             )
+
+    def test_thread_step_notes_share_the_parent_task(self):
+        opened = self.database.create_thread(
+            {
+                "date": self.today,
+                "title": "选品结论",
+                "done_when": "能讲清这个细分做不做",
+                "step": "拆 10 个竞品",
+            }
+        )
+        entry = next(item for item in opened["entries"] if item["thread_id"])
+        first = self.database.create_memo(
+            {"entry_id": entry["id"], "content": "主线这一步的第一句"}
+        )
+        second = self.database.create_memo(
+            {"entry_id": entry["id"], "content": "主线这一步的第二句"}
+        )
+
+        self.assertIsNone(entry["parent_id"])
+        self.assertEqual(first["source_kind"], "thread")
+        self.assertEqual(first["source_task_id"], entry["task_id"])
+        self.assertEqual(second["source_task_id"], entry["task_id"])
+        self.assertEqual(first["source_title"], entry["title"])
+        notes = self.database.list_memos(memo_date=self.today, task_id=entry["task_id"])
+        self.assertEqual({item["id"] for item in notes}, {first["id"], second["id"]})
 
     def test_rich_memo_drops_unsafe_markup(self):
         memo = self.database.create_memo(
