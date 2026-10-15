@@ -1,6 +1,6 @@
 {
   "name": "daily-plan",
-  "version": "0.12.3",
+  "version": "0.13.0",
   "private": true,
   "description": "本地每日计划、计时与复盘"
 }

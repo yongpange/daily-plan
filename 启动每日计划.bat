@@ -9,7 +9,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-py -3 server.py
+py -3 -m app.main
 if errorlevel 1 (
   echo.
   echo 每日计划未能启动，请查看 data\daily_plan.log。

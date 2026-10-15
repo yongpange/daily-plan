@@ -1,0 +1,53 @@
+# 每日计划 — FastAPI 服务端规范
+
+个人每日计划 / 复盘 / 感悟库应用。Python 3.12 + FastAPI + Pydantic v2，SQLite（裸 SQL，异步包装）。
+
+## 目录结构
+
+```
+app/
+├── main.py            # 应用工厂：lifespan、异常处理、中间件、路由注册、静态资源、CLI 入口
+├── core/              # 与业务无关的基础设施
+│   ├── config.py      #   Settings（pydantic-settings，环境变量前缀 DAILY_PLAN_）
+│   ├── errors.py      #   AppError + 全局异常处理（错误响应统一 {"error": "..."}）
+│   ├── security.py    #   认证（API Key，未配置时放行）、滑动窗口限流
+│   ├── deps.py        #   通用 Depends：db / settings / auth / extensions / usage_recorder
+│   ├── time.py        #   utc_now / seconds_between / add_seconds / DATE_FORMAT
+│   ├── validators.py  #   valid_date / valid_remind_at / as_non_negative_int / period_bounds
+│   └── database.py    #   Database：SQLite 连接与全部数据访问（同步实现，唯一允许写 SQL 的地方）
+├── models/            # 数据模型层
+│   ├── schema.sql     #   全部 DDL（唯一事实来源）
+│   └── migrations.py  #   结构演进与数据迁移
+├── schemas/           # Pydantic 请求/响应模型（接口类型契约，一个业务域一个文件）
+├── services/          # 业务逻辑层：async，一个业务域一个文件
+├── routers/           # 路由层：薄路由，只做 解析 → 调 service → 返回
+└── extensions/        # AI 能力扩展点（协议 + 空实现，不在业务代码里实现 AI）
+    ├── base.py        #   UsageRecorder / UsageRecord（Token 统计）
+    ├── llm.py         #   LLMProvider（对话流 / 生图流）
+    ├── rag.py         #   RAGRetriever
+    ├── agent.py       #   AgentRunner
+    ├── mcp.py         #   MCPToolRegistry
+    └── registry.py    #   Extensions 容器 + build_extensions 装配
+```
+
+## 硬性约定
+
+1. **契约优先**：HTTP 方法、路径、请求字段、响应字段、状态码、错误文案必须与
+   `docs/refactor/api-catalog.md` 一致——前端依赖这些形状。错误响应统一 `{"error": "文案"}`。
+2. **分层调用**：routers → services → database。路由不写业务/SQL；service 不直接碰 request/response。
+3. **不许阻塞事件循环**：Database 方法是同步的，service 里一律
+   `from starlette.concurrency import run_in_threadpool`，`await run_in_threadpool(db.xxx, ...)`。
+4. **业务错误抛 `AppError(message, status)`**，文案保持中文原文，由全局处理器转成响应。
+5. **请求/响应模型**：所有请求体、响应体用 Pydantic v2 定义在 `app/schemas/`，路由声明
+   `response_model`。字段默认值、枚举、约束（如长度上限）沿用旧实现。
+6. **横切关注点用 Depends**：认证 `AuthDep`、限流 `Depends(rate_limit)`、扩展点 `ExtensionsDep`、
+   Token 统计 `UsageDep`。不许在路由里手写鉴权/计数。
+7. **AI 功能只走 extensions 协议**，本阶段不实现任何真实大模型/RAG/Agent/MCP 逻辑。
+8. **领域术语**以 `CONTEXT.md` 术语表为准（主线 / 一步 / 下一句 / 今天主推 / 暂停 / 项目 / 任务 / 顺延）。
+
+## 常用命令
+
+```bash
+py -3 -m pytest                          # 跑测试
+py -3 -m app.main --port 8765 --no-browser   # 本地起服务
+```

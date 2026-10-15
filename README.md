@@ -2,17 +2,18 @@
 
 一个本地优先的每日计划、计时与复盘工具。所有任务、工作记录、感悟和复盘数据都保存在项目目录中的 SQLite 文件，不依赖云端账号。
 
-当前版本：0.11.0
+当前版本：0.13.0
 
 ## 启动
 
 在 Windows 中双击 `启动每日计划.bat`，或在项目目录运行：
 
 ```powershell
-py -3 server.py
+pip install -r requirements.txt   # 首次运行
+py -3 -m app.main
 ```
 
-浏览器会自动打开 `http://127.0.0.1:8765`。运行窗口需要保持打开，按 `Ctrl+C` 停止。项目只使用 Python 标准库，建议使用 Python 3.10 或更高版本。
+浏览器会自动打开 `http://127.0.0.1:8765`。运行窗口需要保持打开，按 `Ctrl+C` 停止。服务端基于 FastAPI（Python 3.10+），分层结构见 `AGENTS.md`。
 
 ## 数据与持久化
 
@@ -71,5 +72,5 @@ data/daily_plan.sqlite3
 ## 测试
 
 ```powershell
-py -3 -m unittest discover -s tests -v
+py -3 -m pytest
 ```

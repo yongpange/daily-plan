@@ -4,7 +4,9 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from server import AppError, Database, generate_routine_questions
+from app.core.database import Database
+from app.core.errors import AppError
+from app.services.routine_questions import generate_routine_questions
 
 
 class DatabaseTests(unittest.TestCase):
