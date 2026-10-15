@@ -45,7 +45,6 @@ function openAllFeedback(routine: RoutineDay) {
   <section class="panel routine-today-panel">
     <div class="panel-header">
       <div>
-        <p class="eyebrow">每天都要做</p>
         <h2>今日必做</h2>
       </div>
       <span class="routine-lock-label">只能在设置中修改</span>

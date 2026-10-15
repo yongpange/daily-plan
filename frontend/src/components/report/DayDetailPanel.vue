@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { Segment } from '../../types/api'
 import { useReportStore } from '../../stores/report'
 import { useTimerStore } from '../../stores/timer'
@@ -7,6 +7,38 @@ import { localDateString, parseLocalDate, shiftDate, weekBounds } from '../../ut
 import { formatMinutes, formatShortClock } from '../../utils/format'
 import SegmentPopover from './SegmentPopover.vue'
 import SegmentDialog from '../dialogs/SegmentDialog.vue'
+
+function getFullscreenElement(): Element | null {
+  const doc = document as any
+  return (
+    document.fullscreenElement ??
+    doc.webkitFullscreenElement ??
+    doc.msFullscreenElement ??
+    null
+  )
+}
+
+async function enterFullscreen(el: HTMLElement) {
+  const anyEl = el as any
+  if (el.requestFullscreen) {
+    await el.requestFullscreen()
+  } else if (anyEl.webkitRequestFullscreen) {
+    await anyEl.webkitRequestFullscreen()
+  } else if (anyEl.msRequestFullscreen) {
+    await anyEl.msRequestFullscreen()
+  }
+}
+
+async function exitFullscreen() {
+  const doc = document as any
+  if (document.exitFullscreen) {
+    await document.exitFullscreen()
+  } else if (doc.webkitExitFullscreen) {
+    await doc.webkitExitFullscreen()
+  } else if (doc.msExitFullscreen) {
+    await doc.msExitFullscreen()
+  }
+}
 
 const reportStore = useReportStore()
 const timerStore = useTimerStore()
@@ -159,8 +191,8 @@ function shiftDay(direction: number) {
   reportStore.setDayDetailDate(shiftDate(date.value, direction))
 }
 
-function gotoYesterday() {
-  reportStore.setDayDetailDate(shiftDate(localDateString(new Date()), -1))
+function gotoToday() {
+  reportStore.setDayDetailDate(localDateString(new Date()))
 }
 
 function onDateChange(event: Event) {
@@ -199,10 +231,48 @@ function closeDialog() {
 watch(date, () => {
   popover.value = null
 })
+
+// ---------- 全屏 ----------
+
+const panelRef = ref<HTMLElement | null>(null)
+const isFullscreen = ref(false)
+
+function updateFullscreenState() {
+  const active = getFullscreenElement() === panelRef.value
+  isFullscreen.value = active
+  panelRef.value?.classList.toggle('is-fullscreen', active)
+}
+
+async function toggleFullscreen() {
+  if (!panelRef.value) return
+  try {
+    if (isFullscreen.value) {
+      await exitFullscreen()
+    } else {
+      panelRef.value.classList.add('is-fullscreen')
+      await enterFullscreen(panelRef.value)
+    }
+  } catch {
+    panelRef.value.classList.remove('is-fullscreen')
+    // 浏览器可能不允许全屏，忽略错误
+  }
+}
+
+onMounted(() => {
+  document.addEventListener('fullscreenchange', updateFullscreenState)
+  document.addEventListener('webkitfullscreenchange', updateFullscreenState)
+  document.addEventListener('MSFullscreenChange', updateFullscreenState)
+})
+
+onBeforeUnmount(() => {
+  document.removeEventListener('fullscreenchange', updateFullscreenState)
+  document.removeEventListener('webkitfullscreenchange', updateFullscreenState)
+  document.removeEventListener('MSFullscreenChange', updateFullscreenState)
+})
 </script>
 
 <template>
-  <section class="panel day-detail-panel">
+  <section ref="panelRef" class="panel day-detail-panel">
     <div class="panel-header">
       <div>
         <p class="eyebrow">时间都去哪了</p>
@@ -212,7 +282,10 @@ watch(date, () => {
         <button type="button" class="icon-button" aria-label="前一天" @click="shiftDay(-1)">←</button>
         <input type="date" :value="date" aria-label="查看哪一天" @change="onDateChange" />
         <button type="button" class="icon-button" aria-label="后一天" @click="shiftDay(1)">→</button>
-        <button type="button" class="button subtle compact" @click="gotoYesterday">昨天</button>
+        <button type="button" class="button subtle compact" @click="gotoToday">今天</button>
+        <button type="button" class="button subtle compact fullscreen-toggle" @click="toggleFullscreen">
+          {{ isFullscreen ? '退出全屏' : '全屏' }}
+        </button>
       </div>
     </div>
     <p class="day-detail-summary">{{ summaryText }}</p>
@@ -499,5 +572,26 @@ watch(date, () => {
   font-size: 11px;
   font-weight: 700;
   background: #fff;
+}
+
+.day-detail-panel.is-fullscreen {
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  border-radius: 0;
+  border: 0;
+}
+
+.day-detail-panel.is-fullscreen .day-calendar {
+  max-height: calc(100vh - 140px);
+  overflow-y: auto;
+}
+
+.day-detail-panel.is-fullscreen .cal-head {
+  top: 0;
+}
+
+.fullscreen-toggle {
+  margin-left: 4px;
 }
 </style>

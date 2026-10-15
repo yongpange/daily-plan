@@ -358,7 +358,6 @@ onBeforeUnmount(() => {
   <section class="panel task-panel">
     <div class="panel-header">
       <div>
-        <p class="eyebrow">任务清单</p>
         <h2>今天要做的事</h2>
       </div>
       <div class="task-heading-actions">
@@ -512,20 +511,22 @@ onBeforeUnmount(() => {
         class="thread-card"
         :class="{ 'is-featured': thread.featured, 'is-paused': thread.status === 'paused' }"
       >
-        <p class="thread-kicker">
-          {{
-            thread.status === 'paused'
-              ? '暂停的主线'
-              : thread.featured
-                ? '今天主推'
-                : '另一条主线'
-          }}
-        </p>
-        <h3>
-          <span v-if="thread.project_name" class="project-tag">{{ thread.project_name }}</span>
-          {{ thread.title }}
-        </h3>
-        <p class="thread-done">做到：{{ thread.done_when }}</p>
+        <div class="thread-head">
+          <span class="thread-kicker">
+            {{
+              thread.status === 'paused'
+                ? '暂停的主线'
+                : thread.featured
+                  ? '今天主推'
+                  : '另一条主线'
+            }}
+          </span>
+          <h3>
+            <span v-if="thread.project_name" class="project-tag">{{ thread.project_name }}</span>
+            {{ thread.title }}
+          </h3>
+          <span class="thread-done">做到：{{ thread.done_when }}</span>
+        </div>
         <p class="thread-recent">{{ threadRecentLabel(thread) }}</p>
         <div class="thread-actions">
           <template v-if="thread.status === 'paused'">
@@ -766,15 +767,22 @@ onBeforeUnmount(() => {
 }
 
 .thread-card.is-featured {
-  border-color: #e3d3a4;
-  background: #fffaf0;
+  background: #fbfcfb;
 }
 
 .thread-card.is-paused {
   background: #f7f8f7;
 }
 
+.thread-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
 .thread-kicker {
+  flex: 0 0 auto;
   margin: 0;
   color: #8a7342;
   font-size: 11px;
@@ -782,11 +790,24 @@ onBeforeUnmount(() => {
 }
 
 .thread-card h3 {
-  margin: 2px 0 0;
+  margin: 0;
   font-size: 16px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.thread-done,
+.thread-done {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .thread-recent {
   margin: 4px 0 0;
   color: var(--muted);

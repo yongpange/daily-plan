@@ -200,11 +200,22 @@ export const useMemoStore = defineStore('memo', () => {
     await memoApi.updateMemo(memoId, { ...payload, content_format: 'rich' })
   }
 
+  // 与后端 list_memos 的 ORDER BY 保持一致：置顶 → 日期 → 创建时间
+  function sortMemoList(list: Memo[]) {
+    list.sort(
+      (a, b) =>
+        Number(b.pinned) - Number(a.pinned) ||
+        String(b.memo_date).localeCompare(String(a.memo_date)) ||
+        String(b.created_at).localeCompare(String(a.created_at)),
+    )
+  }
+
   async function toggleMemoPin(memo: Memo) {
     const updated = await memoApi.updateMemo(Number(memo.id), { pinned: !memo.pinned })
     const replace = (list: Memo[]) => {
       const index = list.findIndex((item) => item.id === memo.id)
       if (index >= 0) list[index] = { ...list[index], pinned: updated.pinned }
+      sortMemoList(list)
     }
     replace(memos.value)
     replace(todayMemos.value)
