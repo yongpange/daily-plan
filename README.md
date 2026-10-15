@@ -2,11 +2,11 @@
 
 一个本地优先的每日计划、计时与复盘工具。所有任务、工作记录、感悟和复盘数据都保存在项目目录中的 SQLite 文件，不依赖云端账号。
 
-当前版本：0.13.0
+当前版本：0.14.0
 
 ## 启动
 
-在 Windows 中双击 `启动每日计划.bat`，或在项目目录运行：
+在 Windows 中双击 `启动每日计划.bat`（自动构建前端并以生产模式启动），或在项目目录运行：
 
 ```powershell
 pip install -r requirements.txt   # 首次运行
@@ -14,6 +14,8 @@ py -3 -m app.main
 ```
 
 浏览器会自动打开 `http://127.0.0.1:8765`。运行窗口需要保持打开，按 `Ctrl+C` 停止。服务端基于 FastAPI（Python 3.10+），分层结构见 `AGENTS.md`。
+
+前端是 Vue 3 + Vite + TypeScript 工程（`frontend/`）。日常开发先 `py -3 -m app.main --no-browser`（后端 :8765），再 `npm run dev`（前端 :5173，`/api` 代理到 8765）。
 
 ## 数据与持久化
 

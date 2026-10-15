@@ -1,6 +1,6 @@
-# 每日计划 — FastAPI 服务端规范
+# 每日计划 — 全栈规范
 
-个人每日计划 / 复盘 / 感悟库应用。Python 3.12 + FastAPI + Pydantic v2，SQLite（裸 SQL，异步包装）。
+个人每日计划 / 复盘 / 感悟库应用。后端：Python 3.12 + FastAPI + Pydantic v2，SQLite（裸 SQL，异步包装）。前端：Vue 3 + Vite + TypeScript + Pinia + Vue Router（工程在 `frontend/`，构建产物输出到 `web/` 由 FastAPI 伺服）。
 
 ## 目录结构
 
@@ -28,6 +28,18 @@ app/
     ├── agent.py       #   AgentRunner
     ├── mcp.py         #   MCPToolRegistry
     └── registry.py    #   Extensions 容器 + build_extensions 装配
+
+frontend/                # Vue 3 + Vite + TS 前端（Vite 构建产物输出到 ../web）
+├── src/
+│   ├── api/             #   axios 实例（http.ts：baseURL /api、统一错误文案、loading 计数）
+│   │                    #   + 各业务域模块 + sse.ts（SSE 流式通用封装，预留）
+│   ├── stores/          #   Pinia：day / timer / memo / report / routine / reminder / settings / ui / dialogs
+│   ├── router/          #   /today /report /memos /settings
+│   ├── types/api.ts     #   全部接口类型（与 docs/refactor/api-catalog.md 一致）
+│   ├── utils/           #   date / format / note（富文本白名单消毒）/ storage / image
+│   ├── assets/base.css  #   主题变量、reset、按钮、面板、弹窗基类、富文本排版（跨组件公共样式）
+│   └── components/      #   layout / common / today / report / memos / settings / dialogs
+web/                     # Vite 构建产物（git 忽略，由 启动每日计划.bat 生成）
 ```
 
 ## 硬性约定
@@ -45,9 +57,21 @@ app/
 7. **AI 功能只走 extensions 协议**，本阶段不实现任何真实大模型/RAG/Agent/MCP 逻辑。
 8. **领域术语**以 `CONTEXT.md` 术语表为准（主线 / 一步 / 下一句 / 今天主推 / 暂停 / 项目 / 任务 / 顺延）。
 
+## 前端约定
+
+1. 组件一律 `<script setup lang="ts">`；HTTP 调用只能走 `src/api/`；跨组件共享状态放 `src/stores/`。
+2. 秒级实时 UI 依赖 `timer` store 的 `now`（全局每秒 tick），不要自建 setInterval 刷 DOM。
+3. memo 等富文本用 `utils/note.ts` 的 `renderMemoHtml` + `v-html`（白名单消毒在此）。
+4. 新增接口先在 `types/api.ts` 补类型，再在各域 api 模块加函数。
+5. AI 流式能力统一走 `api/sse.ts` 的 `postStream`（后端帧格式 `data: <json>\n\n`）。
+
 ## 常用命令
 
 ```bash
-py -3 -m pytest                          # 跑测试
-py -3 -m app.main --port 8765 --no-browser   # 本地起服务
+py -3 -m pytest                          # 跑后端测试
+py -3 -m app.main --port 8765 --no-browser   # 本地起服务（伺服 web/ 构建产物）
+npm run dev                              # 前端开发服务器（:5173，/api 代理到 8765）
+npm run build                            # 构建前端到 web/
+启动每日计划.bat                          # 双击：构建 + 生产模式启动
 ```
+
